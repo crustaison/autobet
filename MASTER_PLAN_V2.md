@@ -489,52 +489,165 @@ COMPAT_RULES = [
 
 ---
 
-## Section F — Autoresearch Experiment Loop
+## Section F — Autoresearch / LLM-as-Optimizer Loop
 
-**Priority: LOW** — Only implement after live execution is stable.
+**Priority: HIGH** — This is the core of the decision engine. Betbot already runs this loop in `~/autoresearch/`. Autobet must either bridge to betbot's signal files or run its own equivalent. Without this, the decision engine is just a basic MiniMax prompt — no continuous improvement, no evolved strategy.
 
-### F.1 Purpose
+---
 
-A measurable experiment loop that changes one parameter at a time, runs a replay or paper evaluation, scores the result, and keeps or reverts the change.
+### F.1 What This Really Is
 
-### F.2 What it is NOT
+The autoresearch loop is **not** a parameter sweep. It is an **LLM-as-code-optimizer**: MiniMax M2.7 iteratively rewrites a Python strategy script (`kalshi_analyze.py`) using P&L feedback from live paper trading. The loop runs as a background process on ryz.local, never stopping unless crashed.
 
-- It is NOT autonomous. Every change requires operator review before keeping.
-- It must NOT modify live settings directly.
-- It must NOT run live trades.
+Each iteration:
+1. Run the current `kalshi_analyze.py` on the full Kalshi tick history → get a SCORE (float, higher = better)
+2. Run the Kalshi sim to get total P&L context
+3. Build a prompt: current script code + SCORE + P&L + recent insights + system instructions
+4. Call MiniMax M2.7 → it returns a **new, complete Python script** (not a diff, a full rewrite)
+5. Extract Python code from the response (between triple backticks)
+6. Run the new script → if it crashes, REVERT to previous version
+7. If score ≥ old score (or within explore tolerance), KEEP the new version; else REVERT
+8. Save every version to `kalshi_history/` with timestamp + score
+9. Write signals to `kalshi_signals.json` (the bridge to the Go engine)
+10. Sleep until the next 15-minute window opens
 
-### F.3 Experiment types to support
+**No GPU required.** MiniMax runs via API (`MINIMAX_BASE_URL` + `MINIMAX_API_KEY` from `~/autoresearch/.env`). The loop just needs a network connection and Python.
 
-1. **Threshold tuning** — change the rules engine mid/spread thresholds by ±0.02, run replay, compare win rate
-2. **Stake policy tuning** — change min/max stake by ±$2, run paper simulation, compare EV
-3. **Engine comparison** — run replay with engine A vs engine B on same date range, compare results
-4. **Confidence threshold tuning** — if KNN confidence < X, pass. Sweep X from 0.5 to 0.8 in 0.05 steps.
+---
 
-### F.4 Experiment table
+### F.2 The Signals File Bridge
 
-```sql
-CREATE TABLE IF NOT EXISTS experiments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    param_changed TEXT NOT NULL,
-    old_value TEXT NOT NULL,
-    new_value TEXT NOT NULL,
-    evaluation_type TEXT NOT NULL,  -- 'replay', 'paper'
-    baseline_score REAL,
-    new_score REAL,
-    decision TEXT,  -- 'keep', 'revert', 'pending'
-    notes TEXT,
-    created_at TEXT,
-    decided_at TEXT
-);
+This is how the research loop connects to actual trade decisions:
+
+```
+kalshi_analyze.py (Python, evolved by loop)
+         ↓  writes
+kalshi_signals.json        (BTC)
+kalshi_signals_eth.json    (ETH)
+kalshi_signals_sol.json    (SOL)
+kalshi_signals_xrp.json    (XRP)
+         ↓  reads
+betbot Go engine → loadKalshiSignals()
+         ↓
+Kalshi order placement (live) or paper trade (sim)
 ```
 
-### F.5 Experiment page `/experiments`
+Signal file format (one entry per 15-min window):
+```json
+{
+  "1743800100": {"dir": "YES", "entry": 0.62, "size": 25.0},
+  "1743800700": {"dir": "NO",  "entry": 0.44, "size": 15.0}
+}
+```
+- `dir`: trade direction (YES = price will be higher at close, NO = lower)
+- `entry`: the contract price to pay (0.0–1.0 = 0¢–$1.00)
+- `size`: stake in dollars for this window (Kelly-scaled by confidence)
 
-- Table of past experiments: parameter changed, old vs new value, score delta, decision
-- Button to launch a new experiment (specify parameter, range, evaluation method)
-- Clear "Keep" and "Revert" buttons per experiment with confirmation dialogs
-- No experiment should auto-apply to live settings without operator click
+Autobet's `decision_loop()` can read these same files instead of (or in addition to) calling MiniMax directly per window. This means **autobet does not need to implement the loop itself** to benefit from it — it just needs to consume the signals betbot already generates.
+
+---
+
+### F.3 The SCORE + INSIGHTS Protocol
+
+The `kalshi_analyze.py` script **must** end its stdout with these two lines:
+
+```
+SCORE: 0.742
+INSIGHTS: Detected that high-spread windows (>0.12) are systematically losers. PM confirmation adds 8pp to win rate on YES trades above ask=0.60. XRP shows momentum reversal pattern not seen in BTC.
+```
+
+The loop parses `SCORE:` as a float — the primary keep/revert signal.
+`INSIGHTS:` is fed back to MiniMax in the next prompt as context. This is how the model "remembers" what patterns it has already discovered.
+
+Current scoring heuristics (from the evolved `kalshi_analyze.py`):
+- +1.0 for each WIN trade within the pass/filter criteria
+- -1.0 for each LOSS trade within criteria
+- 0 for skipped windows (pass = no trade)
+- Bonus for high-confidence correct trades
+
+---
+
+### F.4 Keep/Revert Discipline
+
+The loop maintains versioned history at `~/autoresearch/kalshi_history/` (and `kalshi_history_eth/` etc.).
+
+```
+kalshi_history/
+  kalshi_analyze_20260405_143000_score0.742.py
+  kalshi_analyze_20260405_130000_score0.701.py
+  kalshi_analyze_20260405_115500_score0.715.py
+  ...
+```
+
+If the new script crashes (syntax error, runtime exception, produces no SCORE line): **immediate revert, no keep.**
+If new SCORE < old SCORE - explore_tolerance (default 0.05): **revert.**
+If new SCORE ≥ old SCORE - explore_tolerance: **keep** (allows slight exploration).
+
+The loop never deletes history. If performance degrades over many iterations, you can restore any prior version by copying it back.
+
+---
+
+### F.5 Throttle Windows
+
+The loop does not call MiniMax every 15 minutes. It waits until `THROTTLE_WINDOWS` new completed windows exist since the last call (currently 2 for BTC, 3 for alt coins). This prevents burning API tokens on micro-variations and gives the strategy more signal accumulation before each rewrite.
+
+Between calls, the current `kalshi_analyze.py` still runs on each new window to generate signals — the MiniMax rewrite only happens every N windows.
+
+---
+
+### F.6 Betbot vs Autobet: The Two Paths
+
+**Path A — Bridge (recommended first):**
+Autobet reads `~/autoresearch/data/kalshi_signals*.json` directly in `decision_loop()`. When a signal exists for the current window timestamp, use it instead of making a fresh MiniMax call. This means betbot's research loop generates the strategy; autobet just executes it.
+
+Implementation in `decision_loop()`:
+```python
+SIGNAL_FILES = {
+    "BTC": "/home/sean/autoresearch/data/kalshi_signals.json",
+    "ETH": "/home/sean/autoresearch/data/kalshi_signals_eth.json",
+    "SOL": "/home/sean/autoresearch/data/kalshi_signals_sol.json",
+    "XRP": "/home/sean/autoresearch/data/kalshi_signals_xrp.json",
+}
+
+def read_betbot_signal(coin, window_ts):
+    path = SIGNAL_FILES.get(coin)
+    if not path or not os.path.exists(path):
+        return None, None, None
+    try:
+        with open(path) as f:
+            signals = json.load(f)
+        sig = signals.get(str(window_ts))
+        if sig:
+            return sig["dir"], sig["entry"], sig.get("size", 20.0)
+    except Exception:
+        pass
+    return None, None, None
+```
+
+**Path B — Native loop (future):**
+Port `kalshi_loop.py` into autobet as a background thread (`autoresearch_thread`). This makes autobet self-contained — it runs its own evolving strategy without depending on betbot. This is more complex and should only be done once Path A is stable and the rest of autobet is solid (Sections A–E done first).
+
+---
+
+### F.7 Coins and Files
+
+| Coin | Loop script | Analyze script | Signals file | History dir |
+|------|-------------|---------------|--------------|-------------|
+| BTC | `kalshi_loop.py` | `kalshi_analyze.py` | `kalshi_signals.json` | `kalshi_history/` |
+| ETH | `kalshi_loop_coin.py` (COIN=eth) | `kalshi_analyze_eth.py` | `kalshi_signals_eth.json` | `kalshi_history_eth/` |
+| SOL | `kalshi_loop_coin.py` (COIN=sol) | `kalshi_analyze_sol.py` | `kalshi_signals_sol.json` | `kalshi_history_sol/` |
+| XRP | `kalshi_loop_coin.py` (COIN=xrp) | `kalshi_analyze_xrp.py` | `kalshi_signals_xrp.json` | `kalshi_history_xrp/` |
+
+All files live in `~/autoresearch/` on ryz.local.
+
+---
+
+### F.8 Implementation Order
+
+1. **First**: Implement Path A (bridge). Wire `decision_loop()` to check signal files before making its own MiniMax call. This immediately improves decision quality with zero new infrastructure.
+2. **Verify**: Watch autobet's `/decisions` page — signals should appear with sizes from the signal file, not always $20.
+3. **Later**: Add a `/research` page in autobet that shows the current analyze script content, last 10 version history entries, current SCORE, and the INSIGHTS text. Read-only display, no editing from the UI.
+4. **Much later**: Path B (native loop) only if betbot is retired or the loops diverge.
 
 ---
 
