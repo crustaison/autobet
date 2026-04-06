@@ -789,7 +789,7 @@ Respond with JSON only: {{"direction": "YES" or "NO", "entry": 0.XX, "confidence
 
     payload = json.dumps({
         "model": get_minimax_model(),
-        "max_tokens": 200,
+        "max_tokens": 4096,   # M2.7 uses ~700 tokens on thinking before emitting the JSON answer
         "messages": [{"role": "user", "content": prompt}]
     }).encode()
 
@@ -1423,7 +1423,9 @@ SHARED_CSS = """
   .nav a.active { background: #21262d; color: #58a6ff; }
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
   .content { padding: 20px; max-width: 1200px; margin: 0 auto; }
-  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+  @media (max-width: 1100px) { .row { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px)  { .row { grid-template-columns: 1fr; } }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
   .card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
   .coin-badge { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; }
