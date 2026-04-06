@@ -76,17 +76,6 @@ STARTING_CAPITAL = 500.0
 TRADE_SIZE       = 20.0
 KALSHI_FEE_RATE  = 0.07
 
-# Betbot autoresearch signal files — written by kalshi_loop.py on ryz.local
-# The research loop (MiniMax M2.7 rewrites kalshi_analyze.py each window) writes
-# these files. We read them first; only fall back to direct MiniMax if no signal exists.
-BETBOT_SIGNAL_FILES = {
-    "BTC": "/home/sean/autoresearch/data/kalshi_signals.json",
-    "ETH": "/home/sean/autoresearch/data/kalshi_signals_eth.json",
-    "SOL": "/home/sean/autoresearch/data/kalshi_signals_sol.json",
-    "XRP": "/home/sean/autoresearch/data/kalshi_signals_xrp.json",
-}
-_betbot_signals_cache: dict = {}   # {coin: (mtime, {wts_str: {dir, entry, size}})}
-
 # ── Load environment ────────────────────────────────────────────────────────────
 def load_env():
     env = {}
@@ -893,20 +882,7 @@ def decision_loop():
                     prev_wts = wts - 900
                     ticks = get_recent_ticks(conn, coin, prev_wts, n=10)
                     ticks_summary = format_ticks_summary(ticks)
-                    # --- Signals bridge: use betbot's evolved analyze script first ---
-                    bb_dir, bb_entry, bb_size = read_betbot_signal(coin, wts)
-                    if bb_dir:
-                        result = {
-                            "direction": bb_dir,
-                            "entry": bb_entry,
-                            "confidence": 0.75,
-                            "rationale": f"autoresearch signal (evolved strategy)",
-                            "_betbot_size": bb_size,
-                        }
-                    else:
-                        # Fall back to configured engine (minimax_llm / rules / knn / hybrid)
-                        engine_key = get_engine_for_coin(coin)
-                        result = run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary)
+                    result = minimax_analyze(coin, ticks_summary, coin_price)
                     if not result:
                         yes_bid = mkt.get("yes_bid", 0)
                         yes_ask = mkt.get("yes_ask", 0)
@@ -916,9 +892,9 @@ def decision_loop():
                             result = {"direction": "NO", "entry": round(1.0 - yes_bid, 4), "confidence": 0.5, "rationale": "Market favors NO (fallback)"}
                         else:
                             continue
-                    direction = result.get("direction", "")
-                    entry = float(result.get("entry", 0))
-                    confidence = float(result.get("confidence", 0.5))
+# BB disabled                     direction = result.get("direction", "")
+# BB disabled                     entry = float(result.get("entry", 0))
+# BB disabled                     confidence = float(result.get("confidence", 0.5))
                     rationale = result.get("rationale", "")
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
                         continue
@@ -926,13 +902,7 @@ def decision_loop():
                     # Risk check + variable stake
                     acct_pre = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
                     capital_pre = acct_pre[0] if acct_pre else STARTING_CAPITAL
-                    # If the betbot signal provided its own Kelly-sized stake, use it directly.
-                    # Otherwise derive stake from confidence via calc_stake.
-                    betbot_size = result.get("_betbot_size")
-                    if betbot_size and betbot_size > 0:
-                        size = min(betbot_size, capital_pre * 0.10)  # still cap at 10% capital
-                    else:
-                        size = calc_stake(coin, confidence, capital_pre)
+                    size = calc_stake(coin, confidence, capital_pre)
                     ok, reason = check_risk(coin, direction, entry, size)
                     if not ok:
                         print(f"[RISK] {coin}: blocked — {reason}")
@@ -1919,6 +1889,54 @@ def build_health_page(user=None):
     return page_shell("Health", "/health", body, user=user)
 
 
+# ── Research page ────────────────────────────────────────────────────────────────
+def build_research_page(user=None):
+    import glob
+    ar = os.path.expanduser("~/autoresearch")
+    body = '<div class="page-header">Research</div>\n'
+    body += '<div class="page-sub">Autoresearch loop — MiniMax M2.7 evolves the strategy script each window.</div>\n'
+
+    # Current analyze script
+    body += '<div class="section-title">Current kalshi_analyze.py (BTC)</div>\n'
+    body += '<div class="card" style="max-height:400px;overflow:auto">\n'
+    try:
+        with open(f"{ar}/kalshi_analyze.py") as f:
+            content = f.read()
+        body += f'<pre style="font-size:11px;white-space:pre-wrap">{content[:20000]}</pre>\n'
+    except Exception:
+        body += '<div class="muted">File not found — betbot research loop may not be running.</div>\n'
+    body += '</div>\n'
+
+    # Version history
+    body += '<div class="section-title">Version History (last 10)</div>\n'
+    body += '<div class="card">\n'
+    hist = f"{ar}/kalshi_history"
+    if os.path.exists(hist):
+        files = sorted(glob.glob(f"{hist}/*.py"))
+        if files:
+            body += '<table class="trade-table"><tr><th>File</th><th>Score</th><th>Saved</th></tr>\n'
+            for fp in files[-10:][::-1]:
+                name = os.path.basename(fp)
+                mtime = os.path.getmtime(fp)
+                saved = ts_cst(int(mtime)).strftime("%m/%d %H:%M")
+                # extract score from filename e.g. ..._score0.742.py
+                score = "—"
+                if "score" in name:
+                    try:
+                        score = name.split("score")[1].replace(".py", "")
+                    except Exception:
+                        pass
+                body += f'<tr><td style="font-size:11px">{name}</td><td>{score}</td><td>{saved}</td></tr>\n'
+            body += '</table>\n'
+        else:
+            body += '<div class="muted">No history files yet.</div>\n'
+    else:
+        body += '<div class="muted">History directory not found.</div>\n'
+    body += '</div>\n'
+
+    return page_shell("Research", "/research", body, user=user)
+
+
 # ── Chat API ────────────────────────────────────────────────────────────────────
 def handle_chat(message, user=None):
     """Grounded chat: fetch evidence from DB, send to MiniMax."""
@@ -2096,6 +2114,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if "risk" in qs:  msg = "Risk settings saved."
                 if "msg"  in qs:  msg = urllib.parse.unquote(qs["msg"][0])
                 self.send_html(build_settings_page(user=user, msg=msg))
+            elif path == "/research":
+                self.send_html(build_research_page(user=user))
             elif path == "/health":
                 self.send_html(build_health_page(user=user))
             elif path == "/insights":
@@ -2724,141 +2744,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# =============================================================================
-# SECTION A: Decision Engine Registry - Engine Implementations
-# Added by Clyde per MASTER_PLAN_V2.md
-# =============================================================================
-
-def read_betbot_signal(coin, window_ts):
-    """Read the evolved strategy signal from betbot's autoresearch loop.
-
-    Returns (direction, entry, size) or (None, None, None) if no signal exists.
-    Caches the signal file in memory and reloads only when mtime changes.
-    """
-    path = BETBOT_SIGNAL_FILES.get(coin)
-    if not path:
-        return None, None, None
-    try:
-        mtime = os.path.getmtime(path)
-        cached = _betbot_signals_cache.get(coin)
-        if cached and cached[0] == mtime:
-            signals = cached[1]
-        else:
-            with open(path) as f:
-                signals = json.load(f)
-            _betbot_signals_cache[coin] = (mtime, signals)
-        sig = signals.get(str(window_ts))
-        if sig and sig.get("dir") in ("YES", "NO") and sig.get("entry", 0) > 0:
-            return sig["dir"], float(sig["entry"]), float(sig.get("size", TRADE_SIZE))
-    except Exception as e:
-        print(f"[BETBOT_SIGNAL] {coin}: {e}")
-    return None, None, None
-
-
-def get_engine_for_coin(coin):
-    """Get the selected engine for a coin."""
-    conn = db_connect()
-    row = conn.execute("SELECT engine_key FROM market_group_engines WHERE coin=?", (coin,)).fetchone()
-    conn.close()
-    return row[0] if row else "minimax_llm"
-
-def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary):
-    """Dispatcher: route to the appropriate decision engine."""
-    if engine_key == "rules_engine":
-        return rules_engine(coin, mkt, ticks, coin_price)
-    elif engine_key == "vector_knn":
-        return vector_knn_engine(coin, mkt, ticks, coin_price)
-    elif engine_key == "hybrid":
-        return hybrid_engine(coin, mkt, ticks, coin_price)
-    elif engine_key == "minimax_llm":
-        return minimax_analyze(coin, ticks_summary, coin_price)
-    else:
-        # Default to minimax
-        return minimax_analyze(coin, ticks_summary, coin_price)
-
-def rules_engine(coin, mkt, ticks, coin_price):
-    """Engine 2: Rules-based decision engine.
-    
-    Logic:
-    - If spread > 0.15: PASS (too wide, bad fill risk)
-    - If mid > 0.62: YES at yes_ask
-    - If mid < 0.38: NO at (1 - yes_bid)
-    - Else: PASS
-    """
-    try:
-        yes_ask = float(mkt.get("yes_ask", 0) or 0)
-        yes_bid = float(mkt.get("yes_bid", 0) or 0)
-        
-        if yes_ask <= 0 or yes_bid <= 0:
-            return None
-            
-        mid = (yes_bid + yes_ask) / 2
-        spread = yes_ask - yes_bid
-        
-        # Too wide spread
-        if spread > 0.15:
-            return None
-            
-        # Calculate confidence as distance from 0.5, normalized
-        confidence = abs(mid - 0.5) * 2
-        
-        if mid > 0.62:
-            return {
-                "direction": "YES",
-                "entry": yes_ask,
-                "confidence": round(confidence, 4),
-                "rationale": f"Rules: mid={mid:.3f} > 0.62"
-            }
-        elif mid < 0.38:
-            return {
-                "direction": "NO",
-                "entry": round(1.0 - yes_bid, 4),
-                "confidence": round(confidence, 4),
-                "rationale": f"Rules: mid={mid:.3f} < 0.38"
-            }
-        else:
-            return None
-    except Exception as e:
-        print(f"[RULES] Error: {e}")
-        return None
-
-def vector_knn_engine(coin, mkt, ticks, coin_price):
-    """Engine 3: Vector KNN decision engine.
-    
-    Requires >= 200 rows in kalshi_ticks for that coin.
-    Uses 8-dimensional feature vectors and cosine similarity.
-    """
-    try:
-        conn = db_connect()
-        count = conn.execute("SELECT COUNT(*) FROM kalshi_ticks WHERE coin=?", (coin,)).fetchone()[0]
-        if count < 200:
-            conn.close()
-            return {"direction": "PASS", "entry": 0, "confidence": 0, 
-                    "rationale": f"Insufficient history: {count} rows < 200"}
-        
-        # Feature vector would be built here from ticks
-        # For now, fall back to rules engine as placeholder
-        conn.close()
-        return rules_engine(coin, mkt, ticks, coin_price)
-    except Exception as e:
-        return None
-
-def hybrid_engine(coin, mkt, ticks, coin_price):
-    """Engine 4: Hybrid (Rules gate + KNN).
-    
-    Run rules engine first, if PASS return PASS.
-    If rules says YES/NO, run KNN for entry price.
-    """
-    rules_result = rules_engine(coin, mkt, ticks, coin_price)
-    if not rules_result or rules_result.get("direction") == "PASS":
-        return rules_result
-    
-    # If rules says YES/NO, try KNN for better entry
-    knn_result = vector_knn_engine(coin, mkt, ticks, coin_price)
-    if knn_result and knn_result.get("direction") != "PASS":
-        # Average confidence
-        conf = (rules_result.get("confidence", 0) + knn_result.get("confidence", 0)) / 2
-        rules_result["confidence"] = round(conf, 4)
-        rules_result["rationale"] += " + KNN"
-    
-    return rules_result
