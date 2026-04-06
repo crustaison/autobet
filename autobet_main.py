@@ -191,6 +191,12 @@ def db_migrate(conn):
     if cols and "updated_at" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN updated_at TEXT")
         print("[DB] Added updated_at to users table")
+    # paper_trades: add run_id if missing
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(paper_trades)").fetchall()]
+    if cols and "run_id" not in cols:
+        conn.execute("ALTER TABLE paper_trades ADD COLUMN run_id INTEGER")
+        print("[DB] Added run_id to paper_trades")
+
     conn.commit()
 
 def db_init():
@@ -371,6 +377,7 @@ def db_init():
             "INSERT OR IGNORE INTO paper_accounts (coin, capital, updated_at) VALUES (?, ?, ?)",
             (coin, STARTING_CAPITAL, now_cst().isoformat())
         )
+
     conn.commit()
     conn.close()
     print("[DB] Initialized")
@@ -444,6 +451,7 @@ def audit(event_type, object_type="", object_id="", payload=None, actor="system"
             (actor, event_type, object_type, str(object_id),
              json.dumps(payload) if payload else None, now_cst().isoformat())
         )
+
         conn.commit()
         conn.close()
     except:
@@ -481,6 +489,7 @@ def collect_prices():
             conn = db_connect()
             for coin, price in prices.items():
                 conn.execute("INSERT INTO price_history (coin, price, ts) VALUES (?, ?, ?)", (coin, price, ts))
+
             conn.commit()
             conn.close()
         except Exception as e:
@@ -554,6 +563,7 @@ def collect_kalshi():
                     time.sleep(0.5)
                 except Exception as e:
                     print(f"[KALSHI] {coin}: {e}")
+
             conn.commit()
             conn.close()
             with _state_lock:
@@ -618,6 +628,7 @@ def collect_polymarket():
                                 VALUES (?,?,?,?,?,?)
                             """, (coin, str(mid), m.get("question") or m.get("title",""), yes_price, volume, ts))
                         break
+
             conn.commit()
             conn.close()
             with _state_lock:
@@ -715,6 +726,7 @@ def get_active_run_id(coin):
         INSERT INTO paper_runs (name, coin, status, starting_capital, current_capital, config_snapshot, started_at, created_at)
         VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
     """, (f"{coin} Run 1", coin, STARTING_CAPITAL, STARTING_CAPITAL, snap, now_cst().isoformat(), now_cst().isoformat()))
+
     conn.commit()
     run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.close()
@@ -741,6 +753,7 @@ def archive_run(coin, reason="manual"):
         INSERT INTO paper_runs (name, coin, status, starting_capital, current_capital, config_snapshot, started_at, created_at)
         VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
     """, (f"{coin} Run {count + 1}", coin, starting, starting, snap, now_cst().isoformat(), now_cst().isoformat()))
+
     conn.commit()
     conn.close()
     # Reset paper account
@@ -799,7 +812,7 @@ Respond with JSON only, no explanation:
         headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:
             resp = json.loads(r.read().decode())
             text = ""
             for block in resp.get("content", []):
@@ -881,6 +894,7 @@ def resolve_trades():
         """, (actual, round(pnl, 4), round(fee, 4), result,
               round((acct[0] if acct else STARTING_CAPITAL) + pnl, 2),
               coin_close, now_cst().isoformat(), tid))
+
     conn.commit()
     conn.close()
 
@@ -955,6 +969,7 @@ def decision_loop():
                             VALUES (?, ?, ?, ?, ?, ?, ?)
                         """, (coin, wts, "PASS", round(entry, 4), confidence,
                               f"Risk block: {reason}", now_cst().isoformat()))
+
                         conn.commit()
                         continue
 
@@ -972,6 +987,7 @@ def decision_loop():
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (coin, run_id, wts, direction, round(entry, 4), round(size, 4),
                           round(contracts, 4), coin_price, now_cst().isoformat()))
+
                     conn.commit()
                     print(f"[DECISION] {coin} wts={wts}: {direction} @ {entry:.3f}  conf={confidence:.2f}  '{rationale[:50]}'")
                 except Exception as e:
@@ -1160,6 +1176,7 @@ def run_replay(coin, engine_key, start_ts, end_ts, starting_capital=100.0, run_n
         VALUES (?,?,?,?,?,?,'running',?)
     """, (name, coin, engine_key, start_ts, end_ts, starting_capital, now_cst().isoformat()))
     run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
     conn.commit()
 
     # Load historical windows
@@ -1244,6 +1261,7 @@ def run_replay(coin, engine_key, start_ts, end_ts, starting_capital=100.0, run_n
     conn.execute("""
         UPDATE replay_runs SET status='done' WHERE id=?
     """, (run_id,))
+
     conn.commit()
     conn.close()
     print(f"[REPLAY] run_id={run_id} {coin} {engine_key}: {wins}W/{losses}L  bal=${balance:.2f}")
@@ -1258,6 +1276,7 @@ def run_import_job(job_id, source, file_path, coin=None):
         conn.execute("""UPDATE import_jobs SET status=?, records_imported=?, error_msg=?, completed_at=?
                         WHERE id=?""",
                      (status, count, error, now_cst().isoformat(), job_id))
+
         conn.commit()
     try:
         if source == "kalshi_csv":
@@ -1280,6 +1299,7 @@ def run_import_job(job_id, source, file_path, coin=None):
                         count += 1
                     except Exception:
                         pass
+
             conn.commit()
             set_status("done", count=count)
         elif source == "price_csv":
@@ -1296,6 +1316,7 @@ def run_import_job(job_id, source, file_path, coin=None):
                         count += 1
                     except Exception:
                         pass
+
             conn.commit()
             set_status("done", count=count)
         else:
@@ -1423,10 +1444,9 @@ SHARED_CSS = """
   .nav a:hover { background: #21262d; color: #e6edf3; }
   .nav a.active { background: #21262d; color: #58a6ff; }
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
-  .content { padding: 20px; max-width: 1200px; margin: 0 auto; }
+  .content { padding: 20px; max-width: 1600px; margin: 0 auto; }
   .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
-  @media (max-width: 700px) { .row { grid-template-columns: repeat(2, 1fr); } }
-  @media (max-width: 600px)  { .row { grid-template-columns: 1fr; } }
+  @media (max-width: 500px)  { .row { grid-template-columns: repeat(2, 1fr); } }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
   .card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
   .coin-badge { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; }
@@ -2707,7 +2727,7 @@ Answer the user's question concisely using the above context. If asked about a s
             MINIMAX_URL, data=payload,
             headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:
             resp = json.loads(r.read().decode())
             text = ""
             for block in resp.get("content", []):
@@ -2943,6 +2963,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect()
                 conn.execute("INSERT OR REPLACE INTO users (username, password_hash, role, created_at, updated_at) VALUES (?,?,?,?,?)",
                              (username, ph, "admin", now_cst().isoformat(), now_cst().isoformat()))
+
                 conn.commit()
                 conn.close()
                 self.redirect("/onboarding?step=2")
@@ -2959,6 +2980,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 mdd = float(params.get("max_drawdown_pct", 30)) / 100.0
                 conn.execute("UPDATE risk_settings SET daily_loss_limit=?, max_drawdown_pct=?, updated_at=? WHERE id=1",
                              (dl, mdd, now_cst().isoformat()))
+
                 conn.commit()
                 conn.close()
                 self.redirect("/onboarding?step=4")
@@ -2966,6 +2988,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect()
                 conn.execute("UPDATE system_state SET onboarding_complete=1, updated_at=? WHERE id=1",
                              (now_cst().isoformat(),))
+
                 conn.commit()
                 conn.close()
                 audit("onboarding_complete", "system_state")
@@ -2984,6 +3007,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if key in params:
                     conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                                  (key, params[key], now_cst().isoformat()))
+
             conn.commit()
             conn.close()
             audit("settings_saved", "settings", payload=params, actor=user["username"] if user else "system")
@@ -3000,6 +3024,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 UPDATE risk_settings SET kill_switch=?, daily_loss_limit=?, max_drawdown_pct=?,
                 max_stake=?, cooldown_after_losses=?, updated_at=? WHERE id=1
             """, (ks, dll, mdd, ms, cal, now_cst().isoformat()))
+
             conn.commit()
             conn.close()
             audit("risk_settings_saved", "risk_settings", payload={"kill_switch": ks, "daily_loss_limit": dll},
@@ -3014,6 +3039,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 starting = float(cap_row[0]) if cap_row else STARTING_CAPITAL
                 conn.execute("UPDATE paper_accounts SET capital=?, wins=0, losses=0, total_pnl=0, updated_at=? WHERE coin=?",
                              (starting, now_cst().isoformat(), coin))
+
                 conn.commit()
                 conn.close()
                 audit("account_reset", "paper_accounts", coin, actor=user["username"] if user else "system")
@@ -3025,6 +3051,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             new_val = 0 if (row and row[0] == 1) else 1
             conn.execute("UPDATE system_state SET global_live_enabled=?, updated_at=? WHERE id=1",
                          (new_val, now_cst().isoformat()))
+
             conn.commit()
             conn.close()
             audit("live_toggle", "system_state", payload={"global_live_enabled": new_val},
@@ -3038,6 +3065,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect()
                 conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                              (f"mode_{coin}", mode, now_cst().isoformat()))
+
                 conn.commit()
                 conn.close()
                 audit("mode_change", "market_group", coin, payload={"mode": mode},
@@ -3094,6 +3122,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 VALUES (?,?,'running',?)
             """, (source, file_path, now_cst().isoformat()))
             job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
             conn.commit()
             conn.close()
             threading.Thread(target=run_import_job, args=(job_id, source, file_path, coin), daemon=True).start()
@@ -3107,6 +3136,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     INSERT OR REPLACE INTO market_group_engines (coin, engine_key, updated_at)
                     VALUES (?,?,?)
                 """, (coin, ek, now_cst().isoformat()))
+
             conn.commit()
             conn.close()
             audit("engines_saved", "engines", payload=params, actor=user["username"] if user else "system")
@@ -3459,6 +3489,7 @@ def import_betbot_data():
                     print(f"[IMPORT] {coin} decisions: {len(batch_d)}")
             except Exception as e:
                 print(f"[IMPORT] {coin} decisions error: {e}")
+
     conn.commit()
     conn.close()
     msg = f"Imported {total_ticks} ticks, {total_decisions} decisions"
