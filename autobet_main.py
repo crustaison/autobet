@@ -1425,7 +1425,7 @@ SHARED_CSS = """
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
   .content { padding: 20px; max-width: 1200px; margin: 0 auto; }
   .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
-  @media (max-width: 1100px) { .row { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 700px) { .row { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 600px)  { .row { grid-template-columns: 1fr; } }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
   .card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
