@@ -774,18 +774,19 @@ def get_price_at(conn, coin, ts, tol=120):
 def minimax_analyze(coin, ticks_summary, coin_price):
     if not MINIMAX_KEY:
         return None
-    prompt = f"""You are analyzing a Kalshi 15-minute crypto prediction market for {coin}.
+    prompt = f"""You are a quantitative analyst evaluating a 15-minute {coin} price direction signal.
 
-Current {coin} price: ${coin_price:,.2f}
+Current {coin} spot price: ${coin_price:,.2f}
 
-Recent market data (last ~5 minutes of the current 15-min window):
+Order book snapshots from the last 5 minutes (yes_bid = probability market pays for UP outcome, yes_ask = cost to acquire UP position):
 {ticks_summary}
 
-Based on this data:
-1. Should we bet YES (price goes UP in next 15 min) or NO (price goes DOWN)?
-2. What entry price (yes_ask for YES bet, 1-yes_bid for NO bet) represents fair value?
+Task: Predict whether {coin} price will be HIGHER or LOWER in 15 minutes.
+- If HIGHER: direction=YES, entry=yes_ask value
+- If LOWER: direction=NO, entry=(1 - yes_bid) value
 
-Respond with JSON only: {{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "brief reason"}}"""
+Respond with JSON only, no explanation:
+{{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line technical reason"}}"""
 
     payload = json.dumps({
         "model": get_minimax_model(),
@@ -2225,7 +2226,8 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Starting Capital / coin</span><input type="number" name="starting_capital" value="{settings.get('starting_capital', 500)}" step="10" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Min Stake ($)</span><input type="number" name="min_stake" value="{settings.get('min_stake', 20)}" step="5" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Max Stake ($)</span><input type="number" name="max_stake" value="{settings.get('max_stake', 30)}" step="5" style="width:100px"></div>
-<div class="form-row"><span class="form-label">Decision Model</span><input type="text" name="model" value="{settings.get('model', get_minimax_model())}" style="width:220px"></div>
+<div class="form-row"><span class="form-label">Decision Model</span><input type="text" name="model" value="{settings.get('model', get_minimax_model())}" style="width:220px">
+<span class="muted" style="font-size:11px;margin-left:8px">MiniMax-M2.5 recommended — fast, no thinking overhead. M2.7 works but adds ~5s latency per decision.</span></div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Settings</button></div>
 </form>'''
     body += '</div>\n'
