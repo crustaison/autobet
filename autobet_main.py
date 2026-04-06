@@ -898,7 +898,16 @@ def decision_loop():
                     prev_wts = wts - 900
                     ticks = get_recent_ticks(conn, coin, prev_wts, n=10)
                     ticks_summary = format_ticks_summary(ticks)
-                    result = minimax_analyze(coin, ticks_summary, coin_price)
+                    # 1. Try betbot autoresearch signal file first
+                    bb_dir, bb_entry, bb_size = read_betbot_signal(coin, wts)
+                    if bb_dir:
+                        result = {"direction": bb_dir, "entry": bb_entry,
+                                  "confidence": 0.75, "rationale": "autoresearch signal (evolved strategy)",
+                                  "_betbot_size": bb_size}
+                    else:
+                        # 2. Use configured engine (minimax_llm / rules / knn / hybrid)
+                        result = run_engine(get_engine_for_coin(coin), coin, mkt, ticks, coin_price, ticks_summary)
+
                     if not result:
                         yes_bid = mkt.get("yes_bid", 0)
                         yes_ask = mkt.get("yes_ask", 0)
@@ -908,17 +917,22 @@ def decision_loop():
                             result = {"direction": "NO", "entry": round(1.0 - yes_bid, 4), "confidence": 0.5, "rationale": "Market favors NO (fallback)"}
                         else:
                             continue
-# BB disabled                     direction = result.get("direction", "")
-# BB disabled                     entry = float(result.get("entry", 0))
-# BB disabled                     confidence = float(result.get("confidence", 0.5))
-                    rationale = result.get("rationale", "")
+
+                    direction  = result.get("direction", "")
+                    entry      = float(result.get("entry", 0))
+                    confidence = float(result.get("confidence", 0.5))
+                    rationale  = result.get("rationale", "")
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
                         continue
 
                     # Risk check + variable stake
                     acct_pre = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
                     capital_pre = acct_pre[0] if acct_pre else STARTING_CAPITAL
-                    size = calc_stake(coin, confidence, capital_pre)
+                    betbot_size = result.get("_betbot_size")
+                    if betbot_size and betbot_size > 0:
+                        size = min(float(betbot_size), capital_pre * 0.10)
+                    else:
+                        size = calc_stake(coin, confidence, capital_pre)
                     ok, reason = check_risk(coin, direction, entry, size)
                     if not ok:
                         print(f"[RISK] {coin}: blocked — {reason}")
@@ -957,6 +971,326 @@ def decision_loop():
         except Exception as e:
             print(f"[DECISION LOOP] {e}")
         time.sleep(30)
+
+# ── Betbot signals bridge ───────────────────────────────────────────────────────
+BETBOT_SIGNAL_FILES = {
+    "BTC": "/home/sean/autoresearch/data/kalshi_signals.json",
+    "ETH": "/home/sean/autoresearch/data/kalshi_signals_eth.json",
+    "SOL": "/home/sean/autoresearch/data/kalshi_signals_sol.json",
+    "XRP": "/home/sean/autoresearch/data/kalshi_signals_xrp.json",
+}
+_betbot_signals_cache: dict = {}
+
+def read_betbot_signal(coin, window_ts):
+    path = BETBOT_SIGNAL_FILES.get(coin)
+    if not path:
+        return None, None, None
+    try:
+        mtime = os.path.getmtime(path)
+        cached = _betbot_signals_cache.get(coin)
+        if cached and cached[0] == mtime:
+            signals = cached[1]
+        else:
+            with open(path) as f:
+                signals = json.load(f)
+            _betbot_signals_cache[coin] = (mtime, signals)
+        sig = signals.get(str(window_ts))
+        if sig and sig.get("dir") in ("YES", "NO") and sig.get("entry", 0) > 0:
+            return sig["dir"], float(sig["entry"]), float(sig.get("size", TRADE_SIZE))
+    except Exception:
+        pass
+    return None, None, None
+
+
+# ── Decision engine registry ────────────────────────────────────────────────────
+def get_engine_for_coin(coin):
+    try:
+        conn = db_connect()
+        row = conn.execute("SELECT engine_key FROM market_group_engines WHERE coin=?", (coin,)).fetchone()
+        conn.close()
+        return row[0] if row else "minimax_llm"
+    except Exception:
+        return "minimax_llm"
+
+def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary):
+    if engine_key == "rules_engine":
+        return rules_engine(coin, mkt)
+    elif engine_key == "vector_knn":
+        return vector_knn_engine(coin, mkt, ticks)
+    elif engine_key == "hybrid":
+        return hybrid_engine(coin, mkt, ticks)
+    else:  # minimax_llm default
+        return minimax_analyze(coin, ticks_summary, coin_price)
+
+def rules_engine(coin, mkt):
+    try:
+        yes_ask = float(mkt.get("yes_ask", 0) or 0)
+        yes_bid = float(mkt.get("yes_bid", 0) or 0)
+        if yes_ask <= 0 or yes_bid <= 0:
+            return None
+        mid    = (yes_bid + yes_ask) / 2
+        spread = yes_ask - yes_bid
+        if spread > 0.15:
+            return None
+        conf = abs(mid - 0.5) * 2
+        if mid > 0.62:
+            return {"direction": "YES", "entry": yes_ask,
+                    "confidence": round(conf, 4), "rationale": f"Rules: mid={mid:.3f}>0.62"}
+        elif mid < 0.38:
+            return {"direction": "NO", "entry": round(1.0 - yes_bid, 4),
+                    "confidence": round(conf, 4), "rationale": f"Rules: mid={mid:.3f}<0.38"}
+    except Exception:
+        pass
+    return None
+
+def vector_knn_engine(coin, mkt, ticks, k=10):
+    """KNN: build 8-feature vector for current window, find K nearest historical
+    neighbors in kalshi_ticks, vote on direction by their actual outcomes."""
+    try:
+        import math
+        yes_ask = float(mkt.get("yes_ask", 0) or 0)
+        yes_bid = float(mkt.get("yes_bid", 0) or 0)
+        if yes_ask <= 0 or yes_bid <= 0:
+            return None
+        mid    = (yes_bid + yes_ask) / 2
+        spread = yes_ask - yes_bid
+
+        # Build query feature vector (8 dims)
+        coin_price = mkt.get("coin_price") or 0
+        secs_left  = float(mkt.get("secs_left", 450) or 450)
+        tick_momentum = 0.0
+        if len(ticks) >= 2:
+            try:
+                mids = [(float(t.get("yes_bid",0))+float(t.get("yes_ask",0)))/2 for t in ticks[-5:] if t.get("yes_ask")]
+                if len(mids) >= 2:
+                    tick_momentum = mids[-1] - mids[0]
+            except Exception:
+                pass
+
+        query = [mid, spread, secs_left/900.0, tick_momentum,
+                 yes_ask, yes_bid, (mid-0.5)**2, abs(tick_momentum)]
+
+        # Load historical windows that have known outcomes from decisions table
+        conn = db_connect()
+        hist = conn.execute("""
+            SELECT t.yes_bid, t.yes_ask, t.secs_left, d.direction, d.entry,
+                   t.coin_price, t.window_ts
+            FROM kalshi_ticks t
+            JOIN decisions d ON d.coin=t.coin AND d.window_ts=t.window_ts
+            WHERE t.coin=? AND d.direction IN ('YES','NO') AND d.outcome IS NOT NULL
+            ORDER BY t.ts DESC LIMIT 2000
+        """, (coin,)).fetchall()
+        conn.close()
+
+        if len(hist) < 20:
+            return rules_engine(coin, mkt)  # not enough history, fall back
+
+        # Compute cosine similarity for each historical row
+        def dot(a, b): return sum(x*y for x,y in zip(a,b))
+        def norm(a): return math.sqrt(sum(x*x for x in a)) or 1e-9
+
+        scored = []
+        for row in hist:
+            hb, ha, hs, hdir, he, hcp, hwts = row
+            hb = float(hb or 0); ha = float(ha or 0)
+            if ha <= 0 or hb <= 0: continue
+            hmid   = (hb + ha) / 2
+            hspread= ha - hb
+            hmomentum = 0.0
+            hvec   = [hmid, hspread, float(hs or 450)/900.0, hmomentum,
+                      ha, hb, (hmid-0.5)**2, abs(hmomentum)]
+            sim = dot(query, hvec) / (norm(query) * norm(hvec))
+            scored.append((sim, hdir, he))
+
+        scored.sort(reverse=True)
+        neighbors = scored[:k]
+        yes_votes = sum(1 for _, d, _ in neighbors if d == "YES")
+        no_votes  = k - yes_votes
+        confidence = max(yes_votes, no_votes) / k
+
+        if yes_votes > no_votes:
+            avg_entry = sum(e for _, d, e in neighbors if d == "YES") / yes_votes
+            return {"direction": "YES", "entry": min(round(avg_entry, 4), yes_ask),
+                    "confidence": round(confidence, 4),
+                    "rationale": f"KNN({k}): {yes_votes}/{k} YES neighbors"}
+        elif no_votes > yes_votes:
+            avg_entry = sum(e for _, d, e in neighbors if d == "NO") / no_votes
+            return {"direction": "NO", "entry": min(round(avg_entry, 4), round(1-yes_bid, 4)),
+                    "confidence": round(confidence, 4),
+                    "rationale": f"KNN({k}): {no_votes}/{k} NO neighbors"}
+    except Exception as e:
+        print(f"[KNN] {coin}: {e}")
+    return None
+
+def hybrid_engine(coin, mkt, ticks):
+    """Rules gate first; if signal, refine confidence with KNN."""
+    rules = rules_engine(coin, mkt)
+    if not rules:
+        return None
+    knn = vector_knn_engine(coin, mkt, ticks)
+    if knn and knn.get("direction") == rules.get("direction"):
+        avg_conf = (rules["confidence"] + knn["confidence"]) / 2
+        rules["confidence"] = round(avg_conf, 4)
+        rules["rationale"] += " + KNN"
+    return rules
+
+
+# ── Replay engine ────────────────────────────────────────────────────────────────
+def run_replay(coin, engine_key, start_ts, end_ts, starting_capital=100.0, run_name=None):
+    """Execute a replay run against historical kalshi_ticks data.
+    Returns replay_run_id."""
+    conn = db_connect()
+    name = run_name or f"{coin} {engine_key} replay {ts_cst(start_ts).strftime('%m/%d')}"
+    conn.execute("""
+        INSERT INTO replay_runs (name, coin, engine_key, start_ts, end_ts, starting_capital, status, created_at)
+        VALUES (?,?,?,?,?,?,'running',?)
+    """, (name, coin, engine_key, start_ts, end_ts, starting_capital, now_cst().isoformat()))
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+
+    # Load historical windows
+    windows = conn.execute("""
+        SELECT DISTINCT window_ts FROM kalshi_ticks
+        WHERE coin=? AND window_ts BETWEEN ? AND ?
+        ORDER BY window_ts
+    """, (coin, start_ts, end_ts)).fetchall()
+
+    balance = starting_capital
+    wins = losses = 0
+
+    for (wts,) in windows:
+        # Get the opening tick for this window (lowest secs_left = earliest in window)
+        ticks_rows = conn.execute("""
+            SELECT yes_bid, yes_ask, secs_left, coin_price FROM kalshi_ticks
+            WHERE coin=? AND window_ts=? ORDER BY secs_left DESC
+        """, (coin, wts)).fetchall()
+        if not ticks_rows:
+            continue
+        open_row = ticks_rows[0]
+        close_row = ticks_rows[-1]
+
+        mkt = {"yes_bid": open_row[0], "yes_ask": open_row[1],
+               "secs_left": open_row[2], "coin_price": open_row[3], "window_ts": wts}
+        coin_price_open  = open_row[3] or 0
+        coin_price_close = close_row[3] or 0
+
+        ticks_dicts = [{"yes_bid": r[0], "yes_ask": r[1], "secs_left": r[2]} for r in ticks_rows[:10]]
+
+        # Get engine decision
+        if engine_key == "betbot_signal":
+            bb_dir, bb_entry, _ = read_betbot_signal(coin, wts)
+            if not bb_dir:
+                continue
+            result = {"direction": bb_dir, "entry": bb_entry, "confidence": 0.75}
+        elif engine_key == "rules_engine":
+            result = rules_engine(coin, mkt)
+        elif engine_key == "vector_knn":
+            result = vector_knn_engine(coin, mkt, ticks_dicts)
+        elif engine_key == "hybrid":
+            result = hybrid_engine(coin, mkt, ticks_dicts)
+        else:
+            continue  # skip minimax_llm in replay (no API calls)
+
+        if not result:
+            continue
+        direction = result.get("direction","")
+        entry     = float(result.get("entry", 0))
+        if direction not in ("YES","NO") or entry <= 0 or entry >= 1.0:
+            continue
+
+        # Actual outcome: was price higher at close?
+        if coin_price_open <= 0 or coin_price_close <= 0:
+            continue
+        actual = "YES" if coin_price_close > coin_price_open else "NO"
+
+        size      = min(20.0, balance * 0.10)
+        contracts = size / entry
+        if direction == actual:
+            profit = contracts * (1.0 - entry)
+            import math as _math
+            fee = contracts * min(0.07 * (1.0 - entry), 0.02)
+            net = profit - fee
+            result_str = "WIN"; wins += 1
+        else:
+            net = -(contracts * entry)
+            fee = 0.0; result_str = "LOSS"; losses += 1
+
+        balance += net
+        conn.execute("""
+            INSERT INTO replay_trades
+            (replay_run_id, coin, window_ts, engine_key, direction, entry, size, contracts,
+             pnl, result, balance, decided_at, resolved_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (run_id, coin, wts, engine_key, direction, round(entry,4), round(size,4),
+              round(contracts,4), round(net,4), result_str, round(balance,2),
+              ts_cst(wts).isoformat(), ts_cst(wts+900).isoformat()))
+
+    total = wins + losses
+    win_rate = wins/total if total else 0
+    conn.execute("""
+        UPDATE replay_runs SET status='done' WHERE id=?
+    """, (run_id,))
+    conn.commit()
+    conn.close()
+    print(f"[REPLAY] run_id={run_id} {coin} {engine_key}: {wins}W/{losses}L  bal=${balance:.2f}")
+    return run_id
+
+
+# ── Dataset import helpers ───────────────────────────────────────────────────────
+def run_import_job(job_id, source, file_path, coin=None):
+    """Background worker for dataset import jobs."""
+    conn = db_connect()
+    def set_status(status, error=None, count=0):
+        conn.execute("""UPDATE import_jobs SET status=?, records_imported=?, error_msg=?, completed_at=?
+                        WHERE id=?""",
+                     (status, count, error, now_cst().isoformat(), job_id))
+        conn.commit()
+    try:
+        if source == "kalshi_csv":
+            import csv as _csv
+            count = 0
+            with open(file_path, newline="") as f:
+                reader = _csv.DictReader(f)
+                for row in reader:
+                    try:
+                        c = (coin or row.get("coin","BTC")).upper()
+                        conn.execute("""
+                            INSERT OR IGNORE INTO kalshi_ticks
+                            (coin, window_ts, market_ticker, yes_bid, yes_ask, last_price, secs_left, coin_price, ts)
+                            VALUES (?,?,?,?,?,?,?,?,?)
+                        """, (c, int(row["window_ts"]), row.get("market_ticker",""),
+                              float(row.get("yes_bid",0)), float(row.get("yes_ask",0)),
+                              float(row.get("last_price",0)), float(row.get("secs_left",0)),
+                              float(row.get("coin_price",0) or row.get("btc_price",0)),
+                              int(row.get("ts", row.get("window_ts",0)))))
+                        count += 1
+                    except Exception:
+                        pass
+            conn.commit()
+            set_status("done", count=count)
+        elif source == "price_csv":
+            import csv as _csv
+            count = 0
+            with open(file_path, newline="") as f:
+                reader = _csv.DictReader(f)
+                for row in reader:
+                    try:
+                        c = (coin or "BTC").upper()
+                        conn.execute("INSERT OR IGNORE INTO price_history (coin,price,ts) VALUES (?,?,?)",
+                                     (c, float(row.get("price",0) or row.get("btc_price",0)),
+                                      int(row.get("ts",0))))
+                        count += 1
+                    except Exception:
+                        pass
+            conn.commit()
+            set_status("done", count=count)
+        else:
+            set_status("error", error=f"Unknown source: {source}")
+    except Exception as e:
+        set_status("error", error=str(e))
+    finally:
+        conn.close()
+
 
 # ── Tooltips ────────────────────────────────────────────────────────────────────
 TOOLTIPS = {
@@ -1048,6 +1382,9 @@ SHARED_CSS = """
   .badge-warn { background: #2d2208; color: #d29922; border: 1px solid #9e6a03; }
   .badge-err  { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
   .mkt-ticker { color: #8b949e; font-size: 11px; font-family: monospace; }
+  .alert { padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; }
+  .alert-ok  { background: #1a2f1a; color: #3fb950; border: 1px solid #238636; }
+  .alert-err { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
   .window-bar { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: flex; gap: 24px; align-items: center; font-size: 13px; flex-wrap: wrap; }
   .btn { background: #21262d; border: 1px solid #30363d; color: #e6edf3; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }
   .btn:hover { background: #2d333b; }
@@ -1100,7 +1437,11 @@ def page_shell(title, active_nav, body, extra_js="", user=None):
         ("/decisions",  "Decisions"),
         ("/insights",   "Insights"),
         ("/markets",    "Markets"),
+        ("/engines",    "Engines"),
+        ("/replay",     "Replay"),
+        ("/import",     "Import"),
         ("/runs",       "Runs"),
+        ("/research",   "Research"),
         ("/providers",  "Providers"),
         ("/audit",      "Audit"),
         ("/settings",   "Settings"),
@@ -1905,6 +2246,201 @@ def build_health_page(user=None):
     return page_shell("Health", "/health", body, user=user)
 
 
+# ── Replay page ──────────────────────────────────────────────────────────────────
+def build_replay_page(user=None, msg="", run_id=None):
+    conn = db_connect()
+    body = '<div class="page-header">Replay</div>\n'
+    body += '<div class="page-sub">Run a historical backtest using any engine against collected tick data.</div>\n'
+    if msg:
+        body += f'<div class="alert alert-ok">{msg}</div>\n'
+
+    # Launch form
+    body += '<div class="card">\n<div class="section-title">New Replay</div>\n'
+    body += '<form method="POST" action="/replay/run">\n'
+    body += '<div class="form-row"><span class="form-label">Coin</span><select name="coin" style="width:120px">'
+    for c in COINS:
+        body += f'<option value="{c}">{c}</option>'
+    body += '</select></div>\n'
+    body += '<div class="form-row"><span class="form-label">Engine</span><select name="engine_key" style="width:160px">'
+    for ek, elabel in [("rules_engine","Rules Engine"),("vector_knn","Vector KNN"),
+                       ("hybrid","Hybrid (Rules+KNN)"),("betbot_signal","Betbot Signal")]:
+        body += f'<option value="{ek}">{elabel}</option>'
+    body += '</select></div>\n'
+
+    # Date range — default last 7 days
+    now = int(time.time())
+    d_from = ts_cst(now - 7*86400).strftime("%Y-%m-%d")
+    d_to   = ts_cst(now).strftime("%Y-%m-%d")
+    body += f'<div class="form-row"><span class="form-label">From</span><input type="date" name="date_from" value="{d_from}"></div>\n'
+    body += f'<div class="form-row"><span class="form-label">To</span><input type="date" name="date_to" value="{d_to}"></div>\n'
+    body += '<div class="form-row"><span class="form-label">Starting Capital ($)</span><input type="number" name="starting_capital" value="100" step="10" style="width:100px"></div>\n'
+    body += '<button type="submit" class="btn">▶ Run Replay</button>\n</form>\n</div>\n'
+
+    # Show selected run result
+    if run_id:
+        run = conn.execute("SELECT * FROM replay_runs WHERE id=?", (run_id,)).fetchone()
+        if run:
+            trades = conn.execute("""
+                SELECT window_ts, direction, entry, size, pnl, result, balance
+                FROM replay_trades WHERE replay_run_id=? ORDER BY window_ts
+            """, (run_id,)).fetchall()
+            total = len(trades)
+            wins  = sum(1 for t in trades if t[5]=="WIN")
+            fin_bal = trades[-1][6] if trades else float(run[6])
+            pnl   = fin_bal - float(run[6])
+            wr    = f"{wins/total*100:.1f}%" if total else "—"
+            body += f'<div class="section-title">Result: {run[1]}</div>\n'
+            body += '<div class="card">\n'
+            body += f'<div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value">{total}</span></div>\n'
+            body += f'<div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">{wr}</span></div>\n'
+            pnl_cls = "green" if pnl >= 0 else "red"
+            body += f'<div class="stat-row"><span class="stat-label">Net P&L</span><span class="stat-value {pnl_cls}">${pnl:+.2f}</span></div>\n'
+            body += f'<div class="stat-row"><span class="stat-label">Final Balance</span><span class="stat-value">${fin_bal:.2f}</span></div>\n'
+            body += '</div>\n'
+            if trades:
+                body += '<div class="card" style="margin-top:12px;overflow-x:auto">\n'
+                body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Size</th><th>P&L</th><th>Result</th><th>Balance</th></tr>\n'
+                for t in trades[-50:]:
+                    wts2,direction,entry,size,pnl2,result,balance2 = t
+                    t_str   = ts_cst(wts2).strftime("%m/%d %H:%M")
+                    pnl_cls2= "green" if (pnl2 or 0)>=0 else "red"
+                    badge   = f'<span class="badge badge-{"win" if result=="WIN" else "loss"}">{result}</span>'
+                    body   += f'<tr><td>{t_str}</td><td>{direction}</td><td>{entry:.3f}</td>'
+                    body   += f'<td>${size:.0f}</td><td class="{pnl_cls2}">${pnl2:+.2f}</td>'
+                    body   += f'<td>{badge}</td><td>${balance2:.2f}</td></tr>\n'
+                body += '</table>\n</div>\n'
+
+    # Past runs list
+    runs = conn.execute("""
+        SELECT r.id, r.name, r.coin, r.engine_key, r.starting_capital, r.status, r.created_at,
+               COUNT(t.id) trades, SUM(t.pnl) total_pnl
+        FROM replay_runs r
+        LEFT JOIN replay_trades t ON t.replay_run_id=r.id
+        GROUP BY r.id ORDER BY r.created_at DESC LIMIT 20
+    """).fetchall()
+    conn.close()
+    if runs:
+        body += '<div class="section-title">Past Replays</div>\n<div class="card" style="overflow-x:auto">\n'
+        body += '<table class="trade-table"><tr><th>Name</th><th>Coin</th><th>Engine</th><th>Trades</th><th>P&L</th><th>Status</th><th>View</th></tr>\n'
+        for r in runs:
+            rid,name,coin,ek,sc,status,cat,trades_n,tpnl = r
+            pnl_cls = "green" if (tpnl or 0)>=0 else "red"
+            body += f'<tr><td>{name}</td><td>{coin}</td><td>{ek}</td><td>{trades_n or 0}</td>'
+            body += f'<td class="{pnl_cls}">${(tpnl or 0):+.2f}</td>'
+            body += f'<td><span class="badge badge-{"ok" if status=="done" else "open"}">{status}</span></td>'
+            body += f'<td><a href="/replay?run_id={rid}" class="btn" style="padding:3px 8px;font-size:12px">View</a></td></tr>\n'
+        body += '</table>\n</div>\n'
+    return page_shell("Replay", "/replay", body, user=user)
+
+
+# ── Import Wizard page ────────────────────────────────────────────────────────────
+def build_import_page(user=None, msg="", error=""):
+    conn = db_connect()
+    body = '<div class="page-header">Dataset Import</div>\n'
+    body += '<div class="page-sub">Import historical tick data or price CSVs from the filesystem.</div>\n'
+    if msg:
+        body += f'<div class="alert alert-ok">{msg}</div>\n'
+    if error:
+        body += f'<div class="alert alert-err">{error}</div>\n'
+
+    body += '<div class="card">\n<div class="section-title">Import from File Path</div>\n'
+    body += '<form method="POST" action="/import/run">\n'
+    body += '<div class="form-row"><span class="form-label">Source Type</span>'
+    body += '<select name="source" style="width:180px">'
+    body += '<option value="kalshi_csv">Kalshi Ticks CSV</option>'
+    body += '<option value="price_csv">Price History CSV</option>'
+    body += '</select></div>\n'
+    body += '<div class="form-row"><span class="form-label">Coin</span><select name="coin" style="width:120px">'
+    for c in COINS:
+        body += f'<option value="{c}">{c}</option>'
+    body += '</select></div>\n'
+    body += '<div class="form-row"><span class="form-label">File Path on ryz</span>'
+    body += '<input type="text" name="file_path" placeholder="/home/sean/autoresearch/data/kalshi_ticks.csv" style="width:420px"></div>\n'
+    body += '<button type="submit" class="btn">▶ Start Import</button>\n</form>\n</div>\n'
+
+    # Quick import from betbot data dir
+    body += '<div class="card" style="margin-top:12px">\n<div class="section-title">Quick Import from Betbot</div>\n'
+    body += '<p class="muted" style="font-size:13px">Import all 4 coins from ~/autoresearch/data/ in one click.</p>\n'
+    body += '<form method="POST" action="/settings/import-betbot">'
+    body += '<button type="submit" class="btn">⬇ Import Betbot Data</button></form>\n</div>\n'
+
+    # Job history
+    jobs = conn.execute("""
+        SELECT id, source, file_path, status, records_imported, error_msg, created_at, completed_at
+        FROM import_jobs ORDER BY created_at DESC LIMIT 20
+    """).fetchall()
+    conn.close()
+    if jobs:
+        body += '<div class="section-title" style="margin-top:16px">Import History</div>\n'
+        body += '<div class="card" style="overflow-x:auto">\n'
+        body += '<table class="trade-table"><tr><th>Source</th><th>File</th><th>Status</th><th>Records</th><th>Started</th><th>Error</th></tr>\n'
+        for j in jobs:
+            jid,src,fp,status,count,err,cat,comp = j
+            fp_short = (fp or "")[-40:] if fp else "—"
+            badge_cls = "badge-ok" if status=="done" else ("badge-loss" if status=="error" else "badge-open")
+            body += f'<tr><td>{src}</td><td style="font-size:11px">{fp_short}</td>'
+            body += f'<td><span class="badge {badge_cls}">{status}</span></td>'
+            body += f'<td>{count or 0}</td><td style="font-size:11px">{(cat or "")[:16]}</td>'
+            body += f'<td style="font-size:11px;color:#f85149">{(err or "")[:40]}</td></tr>\n'
+        body += '</table>\n</div>\n'
+    return page_shell("Import", "/import", body, user=user)
+
+
+# ── Engine Manager page ───────────────────────────────────────────────────────────
+def build_engines_page(user=None, msg=""):
+    conn = db_connect()
+    assignments = {r[0]: r[1] for r in conn.execute("SELECT coin, engine_key FROM market_group_engines").fetchall()}
+    conn.close()
+    body = '<div class="page-header">Engine Manager</div>\n'
+    body += '<div class="page-sub">Choose which decision engine fires for each coin. Changes take effect on the next window.</div>\n'
+    if msg:
+        body += f'<div class="alert alert-ok">{msg}</div>\n'
+    engines = [
+        ("minimax_llm",   "MiniMax LLM",         "Calls MiniMax API each window. Best quality, uses tokens."),
+        ("rules_engine",  "Rules Engine",         "Pure rules: mid>0.62=YES, mid<0.38=NO. Fast, no API."),
+        ("vector_knn",    "Vector KNN",           "8-feature cosine similarity vs historical windows. Needs 20+ outcomes."),
+        ("hybrid",        "Hybrid (Rules+KNN)",   "Rules gate then KNN confidence boost. Best of both."),
+        ("betbot_signal", "Betbot Signal (auto)", "Reads evolved strategy signal files from autoresearch loop."),
+    ]
+    body += '<form method="POST" action="/engines/save">\n'
+    body += '<div class="card">\n'
+    body += '<table class="trade-table"><tr><th>Coin</th><th>Engine</th><th>Description</th></tr>\n'
+    for coin in COINS:
+        current = assignments.get(coin, "minimax_llm")
+        body += f'<tr><td style="font-weight:700;color:{COIN_COLORS[coin]}">{coin}</td><td>'
+        body += f'<select name="engine_{coin}" style="width:180px">'
+        for ek, elabel, _ in engines:
+            sel = ' selected' if ek == current else ''
+            body += f'<option value="{ek}"{sel}>{elabel}</option>'
+        body += '</select></td><td class="muted" style="font-size:12px">'
+        desc = next((d for ek,_,d in engines if ek==current), "")
+        body += f'<span id="desc_{coin}">{desc}</span></td></tr>\n'
+    body += '</table>\n</div>\n'
+    body += '<button type="submit" class="btn" style="margin-top:12px">Save Engine Assignments</button>\n</form>\n'
+
+    # Engine status table
+    body += '<div class="section-title" style="margin-top:20px">Engine Status</div>\n<div class="card">\n'
+    body += '<table class="trade-table"><tr><th>Engine</th><th>Label</th><th>Notes</th></tr>\n'
+    for ek, elabel, desc in engines:
+        if ek == "vector_knn":
+            # Check how many outcomes we have
+            try:
+                conn2 = db_connect()
+                outcomes = conn2.execute("SELECT COUNT(*) FROM decisions WHERE outcome IS NOT NULL").fetchone()[0]
+                conn2.close()
+                status_note = f"{outcomes} outcomes in DB" + (" ✓ ready" if outcomes >= 20 else " ⚠ need 20+")
+            except Exception:
+                status_note = "unknown"
+        elif ek == "betbot_signal":
+            found = sum(1 for p in BETBOT_SIGNAL_FILES.values() if os.path.exists(p))
+            status_note = f"{found}/4 signal files present"
+        else:
+            status_note = "always available"
+        body += f'<tr><td><code>{ek}</code></td><td>{elabel}</td><td class="muted" style="font-size:12px">{status_note}</td></tr>\n'
+    body += '</table>\n</div>\n'
+    return page_shell("Engines", "/engines", body, user=user)
+
+
 # ── Research page ────────────────────────────────────────────────────────────────
 def build_research_page(user=None):
     import glob
@@ -2132,6 +2668,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html(build_settings_page(user=user, msg=msg))
             elif path == "/research":
                 self.send_html(build_research_page(user=user))
+            elif path == "/replay":
+                run_id = qs.get("run_id", [None])[0]
+                self.send_html(build_replay_page(user=user, run_id=int(run_id) if run_id else None))
+            elif path == "/import":
+                self.send_html(build_import_page(user=user))
+            elif path == "/engines":
+                self.send_html(build_engines_page(user=user))
             elif path == "/health":
                 self.send_html(build_health_page(user=user))
             elif path == "/insights":
@@ -2358,6 +2901,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/settings/import-betbot":
             msg = import_betbot_data()
             self.redirect(f"/settings?msg={urllib.parse.quote(msg)}")
+
+        elif path == "/replay/run":
+            coin       = params.get("coin", "BTC").upper()
+            engine_key = params.get("engine_key", "rules_engine")
+            date_from  = params.get("date_from", "")
+            date_to    = params.get("date_to", "")
+            starting_capital = float(params.get("starting_capital", 100))
+            try:
+                from datetime import datetime as _dt
+                tz = _get_tz()
+                start_ts = int(_dt.strptime(date_from, "%Y-%m-%d").replace(tzinfo=tz).timestamp())
+                end_ts   = int(_dt.strptime(date_to,   "%Y-%m-%d").replace(tzinfo=tz).timestamp()) + 86400
+            except Exception:
+                start_ts = int(time.time()) - 7*86400
+                end_ts   = int(time.time())
+            # Run in background thread
+            run_id_holder = [None]
+            def _do_replay():
+                run_id_holder[0] = run_replay(coin, engine_key, start_ts, end_ts, starting_capital)
+            t = threading.Thread(target=_do_replay, daemon=True)
+            t.start()
+            t.join(timeout=30)
+            rid = run_id_holder[0]
+            if rid:
+                self.redirect(f"/replay?run_id={rid}")
+            else:
+                self.redirect("/replay?msg=Replay+timed+out+or+no+data")
+
+        elif path == "/import/run":
+            source    = params.get("source", "kalshi_csv")
+            file_path = params.get("file_path", "").strip()
+            coin      = params.get("coin", "BTC").upper()
+            if not file_path or not os.path.exists(file_path):
+                self.redirect(f"/import?error={urllib.parse.quote('File not found: ' + file_path)}")
+                return
+            conn = db_connect()
+            conn.execute("""
+                INSERT INTO import_jobs (source, file_path, status, created_at)
+                VALUES (?,?,'running',?)
+            """, (source, file_path, now_cst().isoformat()))
+            job_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.commit()
+            conn.close()
+            threading.Thread(target=run_import_job, args=(job_id, source, file_path, coin), daemon=True).start()
+            self.redirect(f"/import?msg={urllib.parse.quote('Import started (job ' + str(job_id) + ')')}")
+
+        elif path == "/engines/save":
+            conn = db_connect()
+            for coin in COINS:
+                ek = params.get(f"engine_{coin}", "minimax_llm")
+                conn.execute("""
+                    INSERT OR REPLACE INTO market_group_engines (coin, engine_key, updated_at)
+                    VALUES (?,?,?)
+                """, (coin, ek, now_cst().isoformat()))
+            conn.commit()
+            conn.close()
+            audit("engines_saved", "engines", payload=params, actor=user["username"] if user else "system")
+            self.redirect("/engines?saved=1")
 
         elif path == "/api/chat":
             message = params.get("message", "")
