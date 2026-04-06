@@ -92,8 +92,24 @@ def load_env():
 
 ENV = load_env()
 MINIMAX_KEY   = ENV.get("MINIMAX_API_KEY", "")
-MINIMAX_MODEL = ENV.get("MINIMAX_MODEL", "MiniMax-M2.5")
+_MINIMAX_MODEL_DEFAULT = ENV.get("MINIMAX_MODEL", "MiniMax-M2.5")
 KALSHI_KEY_ID = ENV.get("KALSHI_KEY_ID", "bd9c9f63-1f13-4527-8bc6-3c3a05196b49")
+
+def get_minimax_model():
+    """Read the active model from the settings table (falls back to .env default)."""
+    try:
+        conn = db_connect()
+        row = conn.execute("SELECT value FROM settings WHERE key='model'").fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return _MINIMAX_MODEL_DEFAULT
+
+# Keep MINIMAX_MODEL as a property-like alias for startup use only.
+# Always call get_minimax_model() at decision/display time.
+MINIMAX_MODEL = _MINIMAX_MODEL_DEFAULT
 SESSION_SECRET = ENV.get("AUTOBET_SECRET", secrets.token_hex(32))
 
 # ── Kalshi RSA auth ─────────────────────────────────────────────────────────────
@@ -686,7 +702,7 @@ def get_active_run_id(coin):
         return row[0]
     # Create initial run
     rs = get_risk_settings()
-    snap = json.dumps({"model": MINIMAX_MODEL, "trade_size": TRADE_SIZE, "started": now_cst().isoformat()})
+    snap = json.dumps({"model": get_minimax_model(), "trade_size": TRADE_SIZE, "started": now_cst().isoformat()})
     conn.execute("""
         INSERT INTO paper_runs (name, coin, status, starting_capital, current_capital, config_snapshot, started_at, created_at)
         VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
@@ -710,7 +726,7 @@ def archive_run(coin, reason="manual"):
         """, (now_cst().isoformat(), reason, run_id))
     # Count existing runs for this coin
     count = conn.execute("SELECT COUNT(*) FROM paper_runs WHERE coin=?", (coin,)).fetchone()[0]
-    snap = json.dumps({"model": MINIMAX_MODEL, "trade_size": TRADE_SIZE, "started": now_cst().isoformat()})
+    snap = json.dumps({"model": get_minimax_model(), "trade_size": TRADE_SIZE, "started": now_cst().isoformat()})
     cap_row = conn.execute("SELECT value FROM settings WHERE key='starting_capital'").fetchone()
     starting = float(cap_row[0]) if cap_row else STARTING_CAPITAL
     conn.execute("""
@@ -759,7 +775,7 @@ Based on this data:
 Respond with JSON only: {{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "brief reason"}}"""
 
     payload = json.dumps({
-        "model": MINIMAX_MODEL,
+        "model": get_minimax_model(),
         "max_tokens": 200,
         "messages": [{"role": "user", "content": prompt}]
     }).encode()
@@ -1346,7 +1362,7 @@ def build_dashboard(user=None):
   <span>Window: <strong>{wts_cst_str}</strong></span>
   <span>Remaining: <strong style="color:{'#3fb950' if secs_left>300 else '#d29922' if secs_left>60 else '#f85149'}">{secs_left}s</strong></span>
   <span>Mode: {mode_badge}</span>
-  <span>Model: <strong>{MINIMAX_MODEL}</strong></span>
+  <span>Model: <strong>{get_minimax_model()}</strong></span>
 </div>
 <div class="section-title">Market Snapshot</div>
 <div class="row">
@@ -1641,7 +1657,7 @@ def build_providers_page(user=None):
     # Config details
     body += '<div class="section-title">Configuration</div>\n<div class="card">\n'
     body += f'<div class="stat-row"><span class="stat-label">Kalshi Key ID</span><span class="stat-value muted" style="font-family:monospace">{KALSHI_KEY_ID[:20]}…</span></div>\n'
-    body += f'<div class="stat-row"><span class="stat-label">MiniMax Model</span><span class="stat-value">{MINIMAX_MODEL}</span></div>\n'
+    body += f'<div class="stat-row"><span class="stat-label">MiniMax Model</span><span class="stat-value">{get_minimax_model()}</span></div>\n'
     body += f'<div class="stat-row"><span class="stat-label">MiniMax Key</span><span class="stat-value muted">{MINIMAX_KEY[:20] + "…" if MINIMAX_KEY else "missing"}</span></div>\n'
     body += f'<div class="stat-row"><span class="stat-label">Kalshi Base URL</span><span class="stat-value muted" style="font-family:monospace;font-size:11px">{KALSHI_BASE}</span></div>\n'
     body += f'<div class="stat-row"><span class="stat-label">Polymarket Base URL</span><span class="stat-value muted" style="font-family:monospace;font-size:11px">{POLYMARKET_BASE}</span></div>\n'
@@ -1757,7 +1773,7 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Starting Capital / coin</span><input type="number" name="starting_capital" value="{settings.get('starting_capital', 500)}" step="10" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Min Stake ($)</span><input type="number" name="min_stake" value="{settings.get('min_stake', 20)}" step="5" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Max Stake ($)</span><input type="number" name="max_stake" value="{settings.get('max_stake', 30)}" step="5" style="width:100px"></div>
-<div class="form-row"><span class="form-label">Decision Model</span><input type="text" name="model" value="{settings.get('model', MINIMAX_MODEL)}" style="width:220px"></div>
+<div class="form-row"><span class="form-label">Decision Model</span><input type="text" name="model" value="{settings.get('model', get_minimax_model())}" style="width:220px"></div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Settings</button></div>
 </form>'''
     body += '</div>\n'
@@ -1987,12 +2003,12 @@ Paper account balances:
 
 Risk settings: {rs_s}
 
-Model: {MINIMAX_MODEL} | Trade size: ${TRADE_SIZE} | Fee: {KALSHI_FEE_RATE*100:.0f}% of profit (cap $0.02/contract)
+Model: {get_minimax_model()} | Trade size: ${TRADE_SIZE} | Fee: {KALSHI_FEE_RATE*100:.0f}% of profit (cap $0.02/contract)
 
 Answer the user's question based on this evidence. Be concise and specific. If you don't have enough evidence, say so."""
 
         payload = json.dumps({
-            "model": MINIMAX_MODEL,
+            "model": get_minimax_model(),
             "max_tokens": 400,
             "messages": [
                 {"role": "user", "content": f"{context}\n\nUser question: {message}"}
@@ -2131,7 +2147,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
             # API endpoints
             elif path == "/api/health":
-                self.send_json({"status": "ok", "ts": int(time.time()), "model": MINIMAX_MODEL})
+                self.send_json({"status": "ok", "ts": int(time.time()), "model": get_minimax_model()})
             elif path == "/api/prices":
                 with _state_lock:
                     self.send_json(_prices)
