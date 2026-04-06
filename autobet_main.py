@@ -649,21 +649,28 @@ def check_risk(coin, direction, entry, size):
         return False, "Kill switch is active — all trading halted"
     if size > rs["max_stake"]:
         return False, f"Size ${size:.2f} exceeds max stake ${rs['max_stake']:.2f}"
-    # Daily loss check
+    # Get run-reset timestamp — guardrail counters only look at trades AFTER last reset
+    conn = db_connect()
+    reset_row = conn.execute("SELECT value FROM settings WHERE key=?", (f"cooldown_reset_{coin}",)).fetchone()
+    conn.close()
+    reset_after = reset_row[0] if reset_row else "2000-01-01"
+
+    # Daily loss check (only trades since today AND since last run reset)
     try:
-        today_start = int(datetime.combine(now_cst().date(), datetime.min.time()).replace(tzinfo=CST).timestamp())
+        today_str = now_cst().strftime("%Y-%m-%d")
         conn = db_connect()
         row = conn.execute("""
             SELECT COALESCE(SUM(pnl),0) FROM paper_trades
-            WHERE coin=? AND result='LOSS' AND resolved_at >= ?
-        """, (coin, ts_cst(today_start).isoformat())).fetchone()
+            WHERE coin=? AND result='LOSS'
+              AND resolved_at >= ? AND resolved_at >= ?
+        """, (coin, today_str, reset_after)).fetchone()
         daily_loss = abs(float(row[0])) if row else 0.0
         conn.close()
         if daily_loss >= rs["daily_loss_limit"]:
             return False, f"Daily loss limit ${rs['daily_loss_limit']:.0f} reached for {coin} (${daily_loss:.2f} lost today)"
     except:
         pass
-    # Drawdown check
+    # Drawdown check (capital already reset by archive_run so this is naturally correct)
     try:
         conn = db_connect()
         acct = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
@@ -675,13 +682,14 @@ def check_risk(coin, direction, entry, size):
                 return False, f"{coin} capital ${capital:.2f} below max drawdown floor ${floor:.2f}"
     except:
         pass
-    # Cooldown check
+    # Cooldown check (only consecutive losses after last run reset)
     try:
         conn = db_connect()
         recent = conn.execute("""
             SELECT result FROM paper_trades WHERE coin=? AND result IS NOT NULL
+              AND (resolved_at IS NULL OR resolved_at >= ?)
             ORDER BY window_ts DESC LIMIT ?
-        """, (coin, rs["cooldown_after_losses"])).fetchall()
+        """, (coin, reset_after, rs["cooldown_after_losses"])).fetchall()
         conn.close()
         if len(recent) >= rs["cooldown_after_losses"] and all(r[0] == "LOSS" for r in recent):
             return False, f"{coin} in cooldown: {rs['cooldown_after_losses']} consecutive losses"
@@ -739,6 +747,11 @@ def archive_run(coin, reason="manual"):
     conn2 = db_connect()
     conn2.execute("UPDATE paper_accounts SET capital=?, wins=0, losses=0, total_pnl=0, updated_at=? WHERE coin=?",
                   (starting, now_cst().isoformat(), coin))
+    # Reset cooldown state stored in settings so daily-loss and losing-streak
+    # guardrails start fresh. The kill_switch and limits themselves are NOT touched —
+    # only the counters that accumulate against those limits.
+    conn2.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                  (f"cooldown_reset_{coin}", now_cst().isoformat(), now_cst().isoformat()))
     conn2.commit()
     conn2.close()
     audit("paper_run_archived", "paper_run", coin, {"reason": reason})
@@ -1314,6 +1327,23 @@ TOOLTIPS = {
     "paper_run":            "An isolated experiment session with its own capital and trade history.",
     "replay_mode":          "Replay historical data as if it's live, to test strategies without lookahead bias.",
     "cooldown_after_losses": "Number of consecutive losses before a coin enters cooldown (pauses new trades).",
+    # Insights page
+    "drill_down":           "Filter this page to show only data for one coin. Click 'All' to return to all-coin view.",
+    "edge_pct":             "Edge% = win_rate × avg_win_profit − loss_rate × avg_loss. Positive = you have a theoretical profit edge at this confidence/entry level. Negative = you're giving money away.",
+    "confidence_calibration": "How well the model's confidence score predicts actual win rate. If 80% confidence → 80% win rate, calibration is perfect. A big gap means the model is over- or under-confident.",
+    "entry_vs_edge":        "Your entry price affects profitability. Lower entry = higher payout if you win but harder to win. EV (expected value) after Kalshi fees shown per entry price bucket.",
+    "ev":                   "Expected Value: the average profit per $1 risked. EV > 0 means you should trade this bucket; EV < 0 means avoid it even with a high win rate (fees eat the edge).",
+    "prob_bar":             "Visual indicator of Kalshi market probability. Shaded region = bid→ask spread. White line = midpoint. Blue triangle = Polymarket price. Green = YES-leaning (>55%), Red = NO-leaning (<45%).",
+    # Engine manager
+    "engine_minimax_llm":   "Calls MiniMax API each window with tick history + coin price as context. Highest quality, uses API tokens (~$0.001/call). Best when you have reliable API access.",
+    "engine_rules":         "Pure rules: if Kalshi mid > 0.62 bet YES, if mid < 0.38 bet NO, else skip. Zero API calls. Fast. Works best in strongly trending markets. May overtrade in sideways conditions.",
+    "engine_knn":           "Vector KNN: builds an 8-feature vector (mid, spread, momentum, secs_left…) and finds the K=10 most similar historical windows. Votes direction by what those windows did. Requires 20+ resolved decisions in DB.",
+    "engine_hybrid":        "Runs the rules engine first as a gate — if it says PASS, no trade. If it says YES/NO, runs KNN to adjust confidence. Best of both: rules filter + data-driven sizing.",
+    "engine_betbot_signal": "Reads the evolved strategy signal files that betbot's autoresearch loop writes. The loop uses MiniMax M2.7 to rewrite kalshi_analyze.py every few windows based on P&L feedback. Most sophisticated option when the loop is running.",
+    # Replay
+    "replay":               "Run any engine against your collected historical tick data. No API calls are made — the engine runs purely on recorded market snapshots. Use this to compare engines before switching live.",
+    # Run reset
+    "run_reset":            "Archives the current paper run (saves its history) and starts a new one at the configured starting capital. Also resets the daily-loss and cooldown guardrail counters for this coin. The kill switch and loss limits themselves are NOT changed.",
 }
 
 def tooltip_html(key):
@@ -1322,6 +1352,40 @@ def tooltip_html(key):
         return ""
     escaped = text.replace('"', '&quot;')
     return f'<span class="tt" data-tip="{escaped}">ⓘ</span>'
+
+def prob_bar(yes_bid, yes_ask, poly_price=None):
+    """Render a visual probability bar showing Kalshi bid/ask spread and Polymarket marker.
+    The bar shows the full 0–1 range. The shaded region = bid→ask (the spread).
+    A triangle marker shows Polymarket's price if available."""
+    try:
+        yb = float(yes_bid or 0)
+        ya = float(yes_ask or 0)
+        if ya <= 0 or yb < 0 or yb > ya:
+            return ""
+        mid = (yb + ya) / 2
+        # Color: green for YES-leaning (>0.55), red for NO-leaning (<0.45), gray neutral
+        if mid > 0.55:
+            spread_color = "#238636"
+        elif mid < 0.45:
+            spread_color = "#da3633"
+        else:
+            spread_color = "#555"
+        bid_pct  = int(yb * 100)
+        ask_pct  = int(ya * 100)
+        mid_pct  = int(mid * 100)
+        spread_w = ask_pct - bid_pct
+        poly_marker = ""
+        if poly_price:
+            pp = float(poly_price)
+            poly_marker = f'<div style="position:absolute;left:{int(pp*100)}%;top:-3px;width:2px;height:calc(100%+6px);background:#58a6ff;z-index:2" title="Polymarket: {pp:.3f}"></div>'
+        return f'''<div style="position:relative;height:10px;background:#21262d;border-radius:4px;overflow:visible" title="Kalshi: bid={yb:.3f} ask={ya:.3f} mid={mid:.3f}">
+  <div style="position:absolute;left:{bid_pct}%;width:{spread_w}%;height:100%;background:{spread_color};opacity:0.7;border-radius:3px"></div>
+  <div style="position:absolute;left:{mid_pct}%;top:-2px;width:2px;height:calc(100%+4px);background:#fff;opacity:0.6"></div>
+  {poly_marker}
+  <div style="position:absolute;right:0;top:12px;font-size:9px;color:#555;white-space:nowrap">{mid_pct}%</div>
+</div>'''
+    except Exception:
+        return ""
 
 TOOLTIP_CSS = """
   .tt { color: #58a6ff; cursor: help; font-size: 11px; margin-left: 4px; user-select: none; }
@@ -1730,8 +1794,8 @@ def build_dashboard(user=None):
         poly_price = poly_m.get("yes_price")
         poly_str   = f'{poly_price:.3f}' if poly_price else "—"
         if open_t:
-            d2, e2 = open_t[0], open_t[1]
-            open_badge = f'<span class="badge badge-open">{d2} @ {e2:.3f}</span>'
+            d2, e2, sz2 = open_t[0], open_t[1], open_t[2]
+            open_badge = f'<a href="/coin/{coin}" style="text-decoration:none"><span class="badge badge-open" title="Active paper bet — click for details">{d2} @ {e2:.3f} &nbsp;${sz2:.0f} stake</span></a>'
         else:
             open_badge = '<span class="muted" style="font-size:12px">no open bet</span>'
         body += f"""<a href="/coin/{coin}" style="text-decoration:none"><div class="card" style="cursor:pointer;transition:border-color 0.15s" onmouseover="this.style.borderColor='{color}'" onmouseout="this.style.borderColor=''">
@@ -1741,6 +1805,7 @@ def build_dashboard(user=None):
     <div style="margin-left:auto;text-align:right"><div class="price">{price_str}</div></div>
   </div>
   <div class="stat-row"><span class="stat-label">Kalshi Bid/Ask</span><span class="stat-value">{yes_bid:.3f} / {yes_ask:.3f}</span></div>
+  <div style="margin:4px 0 6px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:9px;color:#555;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
   <div class="stat-row"><span class="stat-label">Polymarket YES</span><span class="stat-value muted">{poly_str}</span></div>
   <div class="stat-row"><span class="stat-label">Paper Capital</span><span class="stat-value">${capital:.2f}</span></div>
   <div class="stat-row"><span class="stat-label">Total P&amp;L</span><span class="stat-value {pnl_cls}">${total_pnl:+.2f}</span></div>
@@ -1821,43 +1886,87 @@ def build_trades_page(user=None):
 # ── Decisions page ──────────────────────────────────────────────────────────────
 def build_decisions_page(user=None):
     conn = db_connect()
+    # Coin filter from URL (passed via qs in handler)
     rows = conn.execute("""
         SELECT d.coin, d.window_ts, d.direction, d.entry, d.confidence, d.rationale, d.decided_at,
-               pt.result, pt.pnl
+               pt.result, pt.pnl, pt.size, pt.coin_open, pt.coin_close, pt.actual
         FROM decisions d
         LEFT JOIN paper_trades pt ON pt.coin=d.coin AND pt.window_ts=d.window_ts
-        ORDER BY d.window_ts DESC LIMIT 100
+        ORDER BY d.window_ts DESC LIMIT 200
     """).fetchall()
+
+    # Also show Kalshi windows with NO decision (passed windows)
+    # Get all distinct window_ts from ticks that have no decision
+    decided_wts = {(r[0], r[1]) for r in rows}
+    all_windows = conn.execute("""
+        SELECT DISTINCT coin, window_ts FROM kalshi_ticks
+        WHERE ts > ? ORDER BY window_ts DESC LIMIT 200
+    """, (int(time.time()) - 7*86400,)).fetchall()
     conn.close()
 
     body = '<div class="page-header">Decisions</div>\n'
-    body += '<div class="page-sub">All committed decisions with MiniMax rationale and outcome.</div>\n'
-    if not rows:
-        body += '<div class="card"><div class="muted">No decisions yet.</div></div>'
+    body += '<div class="page-sub">Every 15-minute window — what the engine decided and why. Windows with no trade show the reason they were skipped.</div>\n'
+
+    # Build combined rows: decisions + undecided windows
+    combined = {}
+    for r in rows:
+        coin, wts = r[0], r[1]
+        combined[(coin, wts)] = ("decision", r)
+    for coin, wts in all_windows:
+        if (coin, wts) not in combined:
+            combined[(coin, wts)] = ("skipped", None)
+
+    # Sort by wts desc
+    sorted_items = sorted(combined.items(), key=lambda x: x[0][1], reverse=True)[:200]
+
+    if not sorted_items:
+        body += '<div class="card"><div class="muted">No windows yet.</div></div>'
     else:
-        body += '<div class="card">\n'
-        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Conf</th><th>Rationale</th><th>Outcome</th><th>P&amp;L</th></tr>\n'
-        for r in rows:
-            coin, wts, direction, entry, confidence, rationale, decided_at, result, pnl = r
+        body += '<div class="card" style="overflow-x:auto">\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Action</th><th>Entry</th><th>Conf</th><th>Size</th><th>Open→Close</th><th>Outcome</th><th>P&L</th><th>Why</th></tr>\n'
+        for (coin, wts), (kind, r) in sorted_items:
             color = COIN_COLORS.get(coin, "#555")
-            t_str = ts_cst(wts).strftime("%m/%d %H:%M") if wts else "?"
-            conf_s = f"{confidence:.0%}" if confidence else "—"
-            rat_s  = (rationale or "")[:60]
-            if result == "WIN":
+            t_str = ts_cst(wts).strftime("%m/%d %H:%M")
+            if kind == "skipped":
+                body += f'<tr style="opacity:0.45"><td>{t_str}</td>'
+                body += f'<td><span style="color:{color};font-weight:700">{coin}</span></td>'
+                body += f'<td><span class="badge badge-pass">NO DATA</span></td>'
+                body += f'<td colspan="7" class="muted" style="font-size:11px">No tick data collected for this window</td></tr>\n'
+                continue
+            coin, wts, direction, entry, confidence, rationale, decided_at, result, pnl, size, coin_open, coin_close, actual = r
+            conf_s = f"{confidence:.0%}" if confidence is not None else "—"
+            entry_s = f"{entry:.3f}" if entry else "—"
+            size_s  = f"${size:.0f}" if size else "—"
+            co_s = (f"${coin_open:,.2f}" if coin_open and coin_open > 10 else f"${coin_open:,.4f}" if coin_open else "?")
+            cc_s = (f"${coin_close:,.2f}" if coin_close and coin_close > 10 else f"${coin_close:,.4f}" if coin_close else "?")
+            oc_str = f"{co_s}→{cc_s}" if coin_open and coin_close else "—"
+            rat_full = rationale or ""
+            rat_short = rat_full[:70] + ("…" if len(rat_full) > 70 else "")
+
+            if direction == "PASS":
+                action = '<span class="badge badge-pass">PASS</span>'
+                outcome = '<span class="badge badge-pass">—</span>'
+                pnl_s = "—"; pnl_cls = "muted"
+            elif result == "WIN":
+                action  = f'<span class="badge badge-win">{direction}</span>'
                 outcome = '<span class="badge badge-win">WIN</span>'
+                pnl_s = f"${pnl:+.2f}"; pnl_cls = "green"
             elif result == "LOSS":
+                action  = f'<span class="badge badge-loss">{direction}</span>'
                 outcome = '<span class="badge badge-loss">LOSS</span>'
-            elif direction == "PASS":
-                outcome = '<span class="badge badge-pass">PASS</span>'
+                pnl_s = f"${pnl:+.2f}"; pnl_cls = "red"
             else:
-                outcome = '<span class="badge badge-open">OPEN</span>'
-            pnl_cls = "green" if (pnl or 0) > 0 else "red" if (pnl or 0) < 0 else "muted"
-            pnl_s   = f"${pnl:+.2f}" if pnl is not None else "—"
+                action  = f'<span class="badge badge-open">{direction}</span>'
+                outcome = f'<span class="badge badge-open">{"OPEN" if direction not in ("PASS","") else "—"}</span>'
+                pnl_s = "open" if direction not in ("PASS","") else "—"
+                pnl_cls = "muted"
+
             body += f'<tr><td>{t_str}</td>'
-            body += f'<td><span style="color:{color};font-weight:700">{coin}</span></td>'
-            body += f'<td>{direction}</td><td>{entry:.3f}</td><td>{conf_s}</td>'
-            body += f'<td class="muted" style="font-size:11px">{rat_s}</td>'
-            body += f'<td>{outcome}</td><td class="{pnl_cls}">{pnl_s}</td></tr>\n'
+            body += f'<td><a href="/coin/{coin}" style="color:{color};font-weight:700;text-decoration:none">{coin}</a></td>'
+            body += f'<td>{action}</td><td>{entry_s}</td><td>{conf_s}</td><td>{size_s}</td>'
+            body += f'<td style="font-size:11px">{oc_str}</td><td>{outcome}</td>'
+            body += f'<td class="{pnl_cls}">{pnl_s}</td>'
+            body += f'<td class="muted" style="font-size:11px" title="{rat_full.replace(chr(34), chr(39))}">{rat_short}</td></tr>\n'
         body += '</table>\n</div>\n'
     return page_shell("Decisions", "/decisions", body, user=user)
 
@@ -2527,9 +2636,49 @@ def handle_chat(message, user=None):
 
         rs_s = f"kill_switch={'ON' if rs and rs[0] else 'OFF'}, daily_loss_limit=${rs[1] if rs else 100}, max_drawdown={rs[2]*100 if rs else 30}%" if rs else "default"
 
-        context = f"""You are the Autobet trading platform assistant. Answer questions about the system using the evidence below.
+        context = f"""You are the Autobet trading platform assistant. You help marina staff and operators understand the platform.
 
-Current prices: {prices_s}
+=== PLATFORM OVERVIEW ===
+Autobet is a multi-venue prediction market paper-trading platform. It collects live Kalshi and Polymarket tick data, runs a decision engine each 15-minute window, and simulates trades on paper. Real money is NOT at risk unless Live Mode is explicitly enabled (it is OFF by default).
+
+=== PAGES ===
+- Dashboard: Live coin cards with probability bars, open bets, P&L summary. Click a card to drill into that coin.
+- Trades (/trades): Every paper trade with entry, size, open/close price, P&L.
+- Decisions (/decisions): Every 15-min window — what the engine decided and why. Shows PASS (skipped), YES/NO trades, and the full rationale text from the engine.
+- Insights (/insights): Performance analytics. Click a coin's "Drill down" button to filter to that coin only. Shows win rate, W/L counts, P&L trend, confidence calibration, and entry-price vs edge analysis.
+- Markets (/markets): Live Kalshi + Polymarket data, execution mode per coin (observe/paper/live), global live toggle.
+- Engines (/engines): Choose which decision engine fires per coin. Options: minimax_llm, rules_engine, vector_knn, hybrid, betbot_signal.
+- Replay (/replay): Backtest any engine against historical tick data. No API calls. Pick coin, engine, date range.
+- Import (/import): Import historical CSV data or trigger the betbot data import.
+- Runs (/runs): Isolated paper trading experiments. Archive a run to start fresh. Archiving RESETS the daily-loss and cooldown counters for that coin.
+- Research (/research): Shows the current evolved kalshi_analyze.py strategy script and version history from the autoresearch loop.
+- Providers (/providers): Status of Kalshi, Coinbase, MiniMax, and Polymarket API connections.
+- Audit (/audit): Log of all system actions.
+- Settings (/settings): Trade size, model, risk limits. Run reset button per coin.
+- Health (/health): Recent tick collection status.
+
+=== DECISION ENGINES ===
+- minimax_llm: Calls MiniMax API with market context each window. Best quality, uses tokens.
+- rules_engine: If Kalshi mid > 0.62 → YES, mid < 0.38 → NO, else PASS. No API calls.
+- vector_knn: Finds 10 most similar historical windows by 8-feature cosine similarity, votes direction.
+- hybrid: Rules gate + KNN confidence boost.
+- betbot_signal: Reads signal files from betbot's autoresearch loop (MiniMax M2.7 rewrites the strategy script each window based on P&L feedback). Most sophisticated.
+
+=== PROBABILITY BARS ===
+Each coin card on the dashboard shows a colored bar: shaded region = Kalshi bid/ask spread, white line = midpoint, blue marker = Polymarket price. Green = YES-leaning (>55%), Red = NO-leaning (<45%).
+
+=== ACTIVE BETS ===
+"YES @ 0.620 $25 stake" on a coin card means there is an open paper bet: direction=YES, entered at 0.620 (62 cents per contract), $25 staked. Click the badge or the card to go to /coin/BTC for full details.
+
+=== EDGE% / EV ===
+Edge% on the Insights confidence calibration table: "Edge" means that confidence bucket has >55% win rate historically. "Weak" = <45%. "Neutral" = between.
+EV (expected value) on the entry price analysis = win_rate*(1-entry)*0.93 - loss_rate*entry. Positive = profitable at that entry price after fees.
+
+=== RUN RESET ===
+Archiving a run (Settings → Reset or Runs → Archive) saves the current run history and starts fresh. It resets: paper capital back to starting amount, W/L counters, daily-loss counter, cooldown streak counter. It does NOT change: kill switch, loss limits, drawdown %, max stake.
+
+=== CURRENT STATE ===
+Prices: {prices_s}
 
 Recent decisions (last 10):
 {chr(10).join(dec_lines) or "  None yet"}
@@ -2538,10 +2687,9 @@ Paper account balances:
 {chr(10).join(acct_lines) or "  None yet"}
 
 Risk settings: {rs_s}
+Active model: {get_minimax_model()} | Fee: {KALSHI_FEE_RATE*100:.0f}% of profit (cap $0.02/contract)
 
-Model: {get_minimax_model()} | Trade size: ${TRADE_SIZE} | Fee: {KALSHI_FEE_RATE*100:.0f}% of profit (cap $0.02/contract)
-
-Answer the user's question based on this evidence. Be concise and specific. If you don't have enough evidence, say so."""
+Answer the user's question concisely using the above context. If asked about a specific page or feature, explain it clearly."""
 
         payload = json.dumps({
             "model": get_minimax_model(),
@@ -3062,7 +3210,7 @@ def build_insights_page(user=None, coin_filter=None):
   <div class="stat-row"><span class="stat-label">Total P&amp;L</span><span class="stat-value {pnl_cls}">${(total_pnl or 0):+.2f}</span></div>
   <div class="stat-row"><span class="stat-label">Avg P&amp;L</span><span class="stat-value {pnl_cls}">${(avg_pnl or 0):+.3f}</span></div>
   <div class="stat-row"><span class="stat-label">Expected value</span><span class="stat-value {'green' if exp_val>0 else 'red'}">${exp_val:+.4f}</span></div>
-  <div style="margin-top:8px"><a href="/insights?coin={coin}"><button class="btn" style="font-size:11px">Drill down</button></a></div>
+  <div style="margin-top:8px"><a href="/insights?coin={coin}"><button class="btn" style="font-size:11px">Drill down {tooltip_html("drill_down")}</button></a></div>
 </div>"""
     body += '</div>\n'
 
@@ -3085,8 +3233,8 @@ def build_insights_page(user=None, coin_filter=None):
         body += '</table>\n</div>\n'
 
     if conf_stats:
-        body += '<div class="section-title">Confidence Calibration</div>\n<div class="card">\n'
-        body += '<table class="trade-table"><tr><th>Coin</th><th>Confidence</th><th>Trades</th><th>Win Rate</th><th>Signal</th></tr>\n'
+        body += f'<div class="section-title">Confidence Calibration {tooltip_html("confidence_calibration")}</div>\n<div class="card">\n'
+        body += f'<table class="trade-table"><tr><th>Coin</th><th>Confidence {tooltip_html("confidence")}</th><th>Trades</th><th>Win Rate</th><th>Signal {tooltip_html("edge_pct")}</th></tr>\n'
         for coin, cb, total, wins in conf_stats:
             color = COIN_COLORS.get(coin,"#555")
             wr    = (wins or 0)/total if total else 0
@@ -3097,8 +3245,8 @@ def build_insights_page(user=None, coin_filter=None):
         body += '</table>\n</div>\n'
 
     if entry_stats:
-        body += '<div class="section-title">Entry Price vs Edge</div>\n<div class="card">\n'
-        body += '<table class="trade-table"><tr><th>Coin</th><th>Entry</th><th>Trades</th><th>Win Rate</th><th>Avg P&amp;L</th><th>Fee-adj EV</th></tr>\n'
+        body += f'<div class="section-title">Entry Price vs Edge {tooltip_html("entry_vs_edge")}</div>\n<div class="card">\n'
+        body += f'<table class="trade-table"><tr><th>Coin</th><th>Entry</th><th>Trades</th><th>Win Rate</th><th>Avg P&amp;L</th><th>Fee-adj EV {tooltip_html("ev")}</th></tr>\n'
         for coin, bucket, total, wins, avg_pnl in entry_stats:
             if total < 2: continue
             color = COIN_COLORS.get(coin,"#555")
