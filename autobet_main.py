@@ -993,21 +993,22 @@ def decision_loop():
             if secs_into > 180:
                 time.sleep(30)
                 continue
-            conn = db_connect()
-            for coin in COINS:
+            def _decide_coin(coin, wts, now):
+              try:
+                conn = db_connect()
                 try:
                     existing = conn.execute(
                         "SELECT id FROM decisions WHERE coin=? AND window_ts=?", (coin, wts)
                     ).fetchone()
                     if existing:
-                        continue
+                        return
                     with _state_lock:
                         mkt = _active_mkts.get(coin)
                         coin_price = _prices.get(coin)
                     if not mkt or mkt.get("window_ts") != wts:
-                        continue
+                        return
                     if not coin_price:
-                        continue
+                        return
                     prev_wts = wts - 900
                     ticks = get_recent_ticks(conn, coin, prev_wts, n=10)
                     ticks_summary = format_ticks_summary(ticks)
@@ -1029,14 +1030,14 @@ def decision_loop():
                         """, (coin, wts, "PASS", 0.5, 0.0, "Engine returned no signal — fallback disabled", now_cst().isoformat()))
                         conn.commit()
                         print(f"[DECISION] {coin} wts={wts}: PASS (no engine signal)")
-                        continue
+                        return
 
                     direction  = result.get("direction", "")
                     entry      = float(result.get("entry", 0))
                     confidence = float(result.get("confidence", 0.5))
                     rationale  = result.get("rationale", "")
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
-                        continue
+                        return
 
                     # Risk check + variable stake
                     acct_pre = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
@@ -1056,7 +1057,7 @@ def decision_loop():
                               f"Risk block: {reason}", now_cst().isoformat()))
 
                         conn.commit()
-                        continue
+                        return
 
                     conn.execute("""
                         INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
@@ -1090,7 +1091,7 @@ def decision_loop():
                                   now_cst().isoformat()))
                             conn.commit()
                             print(f"[LIQUIDITY] {coin} wts={wts}: PASS — only {available:.0f} contracts at {entry:.3f}")
-                            continue
+                            return
                         # Reduce to available if less than requested
                         if available < contracts:
                             contracts = available
@@ -1124,7 +1125,14 @@ def decision_loop():
                 except Exception as e:
                     print(f"[DECISION] {coin}: {e}")
                     traceback.print_exc()
-            conn.close()
+                finally:
+                    conn.close()
+              except Exception as e:
+                print(f"[DECISION] {coin} outer: {e}")
+
+            threads = [threading.Thread(target=_decide_coin, args=(coin, wts, now), daemon=True) for coin in COINS]
+            for t in threads: t.start()
+            for t in threads: t.join(timeout=150)
             try:
                 resolve_trades()
             except Exception as e:
@@ -2017,7 +2025,7 @@ def build_dashboard(user=None):
         if not trades:
             body += '<div class="muted" style="font-size:13px;padding:4px 0">No completed trades yet</div>\n'
         else:
-            body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th onclick="sortTable(this)" style="cursor:pointer">Open→Close</th><th>P&amp;L</th><th>Result</th></tr>\n'
+            body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Open→Close</th><th>P&amp;L</th><th>Result</th></tr>\n'
             for t in trades:
                 wts2, direction, entry, size, pnl, result, coin_open, coin_close = t
                 t_str = ts_cst(wts2).strftime("%m/%d %H:%M")
@@ -2049,7 +2057,7 @@ def build_trades_page(user=None):
         body += '<div class="card"><div class="muted">No trades yet — decisions fire in the first 3 minutes of each 15-min window.</div></div>'
     else:
         body += '<div class="card">\n'
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th>Actual</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th onclick="sortTable(this)" style="cursor:pointer">Size</th><th onclick="sortTable(this)" style="cursor:pointer">Open</th><th>Close</th><th>P&amp;L</th><th>Fee</th><th>Result</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Dir</th><th>Actual</th><th>Entry</th><th>Size</th><th>Open</th><th>Close</th><th>P&amp;L</th><th>Fee</th><th>Result</th></tr>\n'
         for r in rows:
             coin, wts, direction, actual, entry, size, pnl, fee, result, co, cc, decided_at, resolved_at = r
             color = COIN_COLORS.get(coin, "#555")
@@ -2117,7 +2125,7 @@ def build_decisions_page(user=None):
         body += '<div class="card"><div class="muted">No windows yet.</div></div>'
     else:
         body += '<div class="card" style="overflow-x:auto">\n'
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Action</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th>Conf</th><th onclick="sortTable(this)" style="cursor:pointer">Size</th><th onclick="sortTable(this)" style="cursor:pointer">Open→Close</th><th>Outcome</th><th onclick="sortTable(this)" style="cursor:pointer">P&L</th><th>Why</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Action</th><th>Entry</th><th>Conf</th><th>Size</th><th>Open→Close</th><th>Outcome</th><th>P&L</th><th>Why</th></tr>\n'
         for (coin, wts), (kind, r) in sorted_items:
             color = COIN_COLORS.get(coin, "#555")
             t_str = ts_cst(wts).strftime("%m/%d %H:%M")
@@ -2204,7 +2212,7 @@ def build_markets_page(user=None, msg=""):
 """
     body += '<div class="section-title">Market Groups</div>\n'
     body += '<div class="card">\n'
-    body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Mode</th><th>Trade Venue</th><th>Kalshi Ticker</th><th>Bid/Ask</th><th>Polymarket</th><th>Price</th><th>Action</th></tr>\n'
+    body += '<table class="trade-table"><tr><th>Coin</th><th>Mode</th><th>Trade Venue</th><th>Kalshi Ticker</th><th>Bid/Ask</th><th>Polymarket</th><th>Price</th><th>Action</th></tr>\n'
 
     for coin in COINS:
         color  = COIN_COLORS[coin]
@@ -2341,7 +2349,7 @@ def build_runs_page(user=None, msg=""):
         body += '<div class="card"><div class="muted">No runs yet — runs are created automatically when the first decision fires.</div></div>'
     else:
         body += '<div class="card">\n'
-        body += '<table class="trade-table"><tr><th>ID</th><th>Name</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Status</th><th>Start $</th><th>Current $</th><th>W/L</th><th>P&amp;L</th><th>Started</th><th>Ended</th><th>Reason</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>ID</th><th>Name</th><th>Coin</th><th>Status</th><th>Start $</th><th>Current $</th><th>W/L</th><th>P&amp;L</th><th>Started</th><th>Ended</th><th>Reason</th></tr>\n'
         for r in runs:
             rid, name, coin, status, start_cap, cur_cap, wins, losses, total_pnl, started_at, ended_at, reset_reason = r
             color = COIN_COLORS.get(coin, "#555")
@@ -2376,7 +2384,7 @@ def build_audit_page(user=None):
         body += '<div class="card"><div class="muted">No audit events yet.</div></div>'
     else:
         body += '<div class="card">\n'
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th>Actor</th><th>Event</th><th>Object</th><th>Details</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Actor</th><th>Event</th><th>Object</th><th>Details</th></tr>\n'
         for log in logs:
             lid, actor, event_type, object_type, object_id, payload, created_at = log
             ts_s = created_at[:16] if created_at else "?"
@@ -2445,7 +2453,7 @@ def build_settings_page(user=None, msg=""):
 
     # Paper accounts
     body += '<div class="section-title">Paper Accounts</div>\n<div class="card">\n'
-    body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Capital</th><th>Wins</th><th>Losses</th><th>P&amp;L</th><th>Action</th></tr>\n'
+    body += '<table class="trade-table"><tr><th>Coin</th><th>Capital</th><th>Wins</th><th>Losses</th><th>P&amp;L</th><th>Action</th></tr>\n'
     for acct in accts:
         coin, capital, wins, losses, total_pnl = acct
         color   = COIN_COLORS.get(coin, "#555")
@@ -2534,7 +2542,7 @@ def build_health_page(user=None):
     ticks = conn.execute("SELECT coin, window_ts, yes_bid, yes_ask, coin_price, ts FROM kalshi_ticks ORDER BY ts DESC LIMIT 20").fetchall()
     conn.close()
     if ticks:
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Window</th><th>Bid</th><th>Ask</th><th>Price</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Window</th><th>Bid</th><th>Ask</th><th>Price</th></tr>\n'
         for t in ticks:
             coin, wts, yes_bid, yes_ask, coin_price, ts = t
             color = COIN_COLORS.get(coin, "#555")
@@ -2603,7 +2611,7 @@ def build_replay_page(user=None, msg="", run_id=None):
             body += '</div>\n'
             if trades:
                 body += '<div class="card" style="margin-top:12px;overflow-x:auto">\n'
-                body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th onclick="sortTable(this)" style="cursor:pointer">Size</th><th onclick="sortTable(this)" style="cursor:pointer">P&L</th><th>Result</th><th>Balance</th></tr>\n'
+                body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Size</th><th>P&L</th><th>Result</th><th>Balance</th></tr>\n'
                 for t in trades[-50:]:
                     wts2,direction,entry,size,pnl2,result,balance2 = t
                     t_str   = ts_cst(wts2).strftime("%m/%d %H:%M")
@@ -2625,7 +2633,7 @@ def build_replay_page(user=None, msg="", run_id=None):
     conn.close()
     if runs:
         body += '<div class="section-title">Past Replays</div>\n<div class="card" style="overflow-x:auto">\n'
-        body += '<table class="trade-table"><tr><th>Name</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Engine</th><th>Trades</th><th onclick="sortTable(this)" style="cursor:pointer">P&L</th><th>Status</th><th>View</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Name</th><th>Coin</th><th>Engine</th><th>Trades</th><th>P&L</th><th>Status</th><th>View</th></tr>\n'
         for r in runs:
             rid,name,coin,ek,sc,status,cat,trades_n,tpnl = r
             pnl_cls = "green" if (tpnl or 0)>=0 else "red"
@@ -2654,7 +2662,7 @@ def build_fill_quality_page(user=None):
     else:
         body += '<div class="card">\n'
         body += '<table class="data-table">\n'
-        body += '<tr><th onclick="sortTable(this)" style="cursor:pointer">Time</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th>Requested</th><th>Available</th><th>Filled</th><th>Status</th></tr>\n'
+        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Requested</th><th>Available</th><th>Filled</th><th>Status</th></tr>\n'
         import datetime as _dt
         for r in rows:
             coin, wts, ticker, direction, entry, req, avail, filled, liq_ok, created_at = r
@@ -2749,7 +2757,7 @@ def build_engines_page(user=None, msg=""):
     ]
     body += '<form method="POST" action="/engines/save">\n'
     body += '<div class="card">\n'
-    body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Engine</th><th>Description</th></tr>\n'
+    body += '<table class="trade-table"><tr><th>Coin</th><th>Engine</th><th>Description</th></tr>\n'
     for coin in COINS:
         current = assignments.get(coin, "minimax_llm")
         body += f'<tr><td style="font-weight:700;color:{COIN_COLORS[coin]}">{coin}</td><td>'
@@ -3483,7 +3491,7 @@ def build_insights_page(user=None, coin_filter=None):
 
     if dir_stats:
         body += '<div class="section-title">By Direction</div>\n<div class="card">\n'
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th onclick="sortTable(this)" style="cursor:pointer">Direction</th><th>Trades</th><th>Win Rate</th><th>Avg P&amp;L</th><th>Signal</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Coin</th><th>Direction</th><th>Trades</th><th>Win Rate</th><th>Avg P&amp;L</th><th>Signal</th></tr>\n'
         for coin, direction, total, wins, avg_pnl in dir_stats:
             color = COIN_COLORS.get(coin,"#555")
             wr    = (wins or 0)/total if total else 0
@@ -3497,7 +3505,7 @@ def build_insights_page(user=None, coin_filter=None):
 
     if conf_stats:
         body += f'<div class="section-title">Confidence Calibration {tooltip_html("confidence_calibration")}</div>\n<div class="card">\n'
-        body += f'<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>Confidence {tooltip_html("confidence")}</th><th>Trades</th><th>Win Rate</th><th>Signal {tooltip_html("edge_pct")}</th></tr>\n'
+        body += f'<table class="trade-table"><tr><th>Coin</th><th>Confidence {tooltip_html("confidence")}</th><th>Trades</th><th>Win Rate</th><th>Signal {tooltip_html("edge_pct")}</th></tr>\n'
         for coin, cb, total, wins in conf_stats:
             color = COIN_COLORS.get(coin,"#555")
             wr    = (wins or 0)/total if total else 0
@@ -3509,7 +3517,7 @@ def build_insights_page(user=None, coin_filter=None):
 
     if entry_stats:
         body += f'<div class="section-title">Entry Price vs Edge {tooltip_html("entry_vs_edge")}</div>\n<div class="card">\n'
-        body += f'<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th>Trades</th><th>Win Rate</th><th>Avg P&amp;L</th><th>Fee-adj EV {tooltip_html("ev")}</th></tr>\n'
+        body += f'<table class="trade-table"><tr><th>Coin</th><th>Entry</th><th>Trades</th><th>Win Rate</th><th>Avg P&amp;L</th><th>Fee-adj EV {tooltip_html("ev")}</th></tr>\n'
         for coin, bucket, total, wins, avg_pnl in entry_stats:
             if total < 2: continue
             color = COIN_COLORS.get(coin,"#555")
@@ -3525,7 +3533,7 @@ def build_insights_page(user=None, coin_filter=None):
 
     if pnl_trend:
         body += '<div class="section-title">Recent P&L Trend (last 40 trades)</div>\n<div class="card">\n'
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Coin</th><th>P&amp;L</th><th>Running Total</th><th>Result</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>P&amp;L</th><th>Running Total</th><th>Result</th></tr>\n'
         rows_rev = list(reversed(pnl_trend))
         cum = 0.0
         for coin, wts, pnl, result in rows_rev:
@@ -3623,7 +3631,7 @@ def build_coin_page(coin, user=None):
     if not decisions:
         body += '<div class="muted">No decisions yet.</div>'
     else:
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th>Conf</th><th>Rationale</th><th>Result</th><th onclick="sortTable(this)" style="cursor:pointer">P&L</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Conf</th><th>Rationale</th><th>Result</th><th>P&L</th></tr>\n'
         for wts, direction, entry, conf, rationale, result, pnl in decisions:
             t_s    = ts_cst(wts).strftime("%m/%d %H:%M") if wts else "?"
             conf_s = f"{conf:.0%}" if conf else "—"
@@ -3647,7 +3655,7 @@ def build_coin_page(coin, user=None):
     if not trades:
         body += '<div class="muted">No trades yet.</div>'
     else:
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th onclick="sortTable(this)" style="cursor:pointer">Size</th><th onclick="sortTable(this)" style="cursor:pointer">Open→Close</th><th onclick="sortTable(this)" style="cursor:pointer">P&L</th><th>Result</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Size</th><th>Open→Close</th><th>P&L</th><th>Result</th></tr>\n'
         for wts, direction, actual, entry, size, pnl, fee, result, co, cc in trades:
             t_s  = ts_cst(wts).strftime("%m/%d %H:%M") if wts else "?"
             co_s = f"${co:,.2f}" if co else "?"
@@ -3669,7 +3677,7 @@ def build_coin_page(coin, user=None):
         # Direction breakdown
         body += '<div class="card">\n<div style="font-weight:600;margin-bottom:10px;font-size:13px">Direction Breakdown</div>\n'
         if dir_stats:
-            body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Dir</th><th>Trades</th><th>Win%</th><th>Avg P&L</th><th>Signal</th></tr>\n'
+            body += '<table class="trade-table"><tr><th>Dir</th><th>Trades</th><th>Win%</th><th>Avg P&L</th><th>Signal</th></tr>\n'
             for direction, total, wins, avg_pnl in dir_stats:
                 wr = (wins or 0)/total if total else 0
                 sig = "Prefer" if wr > 0.52 else "Avoid" if wr < 0.45 else "Neutral"
@@ -3702,7 +3710,7 @@ def build_coin_page(coin, user=None):
         # Entry vs EV
         if entry_stats:
             body += '<div class="card" style="margin-bottom:16px">\n<div style="font-weight:600;margin-bottom:10px;font-size:13px">Entry Price vs EV {}</div>\n'.format(tooltip_html("entry_vs_edge"))
-            body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Entry</th><th>Trades</th><th>Win%</th><th>Avg P&L</th><th>Fee-adj EV</th></tr>\n'
+            body += '<table class="trade-table"><tr><th>Entry</th><th>Trades</th><th>Win%</th><th>Avg P&L</th><th>Fee-adj EV</th></tr>\n'
             for bucket, total, wins, avg_pnl in entry_stats:
                 if total < 2: continue
                 wr = (wins or 0)/total if total else 0
@@ -3718,7 +3726,7 @@ def build_coin_page(coin, user=None):
     # Live ticks
     body += '<div class="section-title">Live Ticks</div>\n<div class="card">\n'
     if ticks:
-        body += '<table class="trade-table"><tr><th onclick="sortTable(this)" style="cursor:pointer">Time (CT)</th><th>Window</th><th>Bid</th><th>Ask</th><th>Price</th></tr>\n'
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Window</th><th>Bid</th><th>Ask</th><th>Price</th></tr>\n'
         for ts_v, wts, yb, ya, cp in ticks:
             t_s = ts_cst(ts_v).strftime("%H:%M:%S")
             w_s = ts_cst(wts).strftime("%H:%M") if wts else "?"
