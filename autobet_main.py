@@ -741,16 +741,20 @@ def check_risk(coin, direction, entry, size):
             return False, f"Daily loss limit ${rs['daily_loss_limit']:.0f} reached for {coin} (${daily_loss:.2f} lost today)"
     except:
         pass
-    # Drawdown check (capital already reset by archive_run so this is naturally correct)
+    # Drawdown check — uses the active run's starting capital, not global constant
     try:
         conn = db_connect()
         acct = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
+        run_row = conn.execute(
+            "SELECT starting_capital FROM paper_runs WHERE coin=? AND status='active' ORDER BY id DESC LIMIT 1", (coin,)
+        ).fetchone()
         conn.close()
         if acct:
             capital = float(acct[0])
-            floor = STARTING_CAPITAL * (1.0 - rs["max_drawdown_pct"])
+            start_cap = float(run_row[0]) if run_row and run_row[0] else capital
+            floor = start_cap * (1.0 - rs["max_drawdown_pct"])
             if capital < floor:
-                return False, f"{coin} capital ${capital:.2f} below max drawdown floor ${floor:.2f}"
+                return False, f"{coin} capital ${capital:.2f} below max drawdown floor ${floor:.2f} ({rs['max_drawdown_pct']*100:.0f}% of ${start_cap:.0f} starting)"
     except:
         pass
     # Cooldown check (only consecutive losses after last run reset)
