@@ -3,6 +3,24 @@ Last updated: 2026-04-07 | Written by Claude
 
 ---
 
+## !! THE ONLY FILE THAT MATTERS !!
+
+~/autobet/autobet_main.py
+
+NOT server.py — that is dead Clyde-era code, not running.
+NOT server_simple.py — dead.
+NOT server.py.bak — dead.
+NOT server_minimal.py — dead.
+NOT any other .py file in ~/autobet/
+
+The running process is: python3 autobet_main.py
+Confirm with: pgrep -a python3 | grep autobet
+The dashboard is at: http://ryz.local:7778/
+
+If you edit anything other than autobet_main.py, nothing will change and you will be confused.
+
+---
+
 ## CRITICAL RULES
 
 1. All code in ONE file: ~/autobet/autobet_main.py (~3600 lines). Do not create new files.
