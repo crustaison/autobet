@@ -75,6 +75,9 @@ MINIMAX_URL   = "https://api.minimax.io/anthropic/v1/messages"
 STARTING_CAPITAL = 500.0
 TRADE_SIZE       = 20.0
 KALSHI_FEE_RATE  = 0.07
+MAX_CONTRACTS    = 500    # Realistic Kalshi order book depth at any price
+ENTRY_FLOOR      = 0.05   # Below this = lottery ticket; liquidity impossible
+ENTRY_CEILING    = 0.95   # Above this = negative EV confirmed across all coins
 
 # ── Load environment ────────────────────────────────────────────────────────────
 def load_env():
@@ -170,8 +173,10 @@ def kalshi_get(path, params=None):
 
 # ── Database ────────────────────────────────────────────────────────────────────
 def db_connect():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 def db_migrate(conn):
@@ -660,6 +665,10 @@ def check_risk(coin, direction, entry, size):
         return False, "Kill switch is active — all trading halted"
     if size > rs["max_stake"]:
         return False, f"Size ${size:.2f} exceeds max stake ${rs['max_stake']:.2f}"
+    if entry < ENTRY_FLOOR:
+        return False, f"Entry {entry:.4f} below floor {ENTRY_FLOOR} — unrealistic liquidity (lottery ticket)"
+    if entry > ENTRY_CEILING:
+        return False, f"Entry {entry:.4f} above ceiling {ENTRY_CEILING} — confirmed negative EV across all coins"
     # Get run-reset timestamp — guardrail counters only look at trades AFTER last reset
     conn = db_connect()
     reset_row = conn.execute("SELECT value FROM settings WHERE key=?", (f"cooldown_reset_{coin}",)).fetchone()
@@ -709,15 +718,19 @@ def check_risk(coin, direction, entry, size):
     return True, "ok"
 
 # ── Paper runs ──────────────────────────────────────────────────────────────────
-def get_active_run_id(coin):
-    """Get the active paper_run id for a coin, creating one if needed."""
-    conn = db_connect()
+def get_active_run_id(coin, conn=None):
+    """Get the active paper_run id for a coin, creating one if needed.
+    Accepts an existing connection to avoid opening a second one mid-transaction."""
+    own_conn = conn is None
+    if own_conn:
+        conn = db_connect()
     row = conn.execute(
         "SELECT id FROM paper_runs WHERE coin=? AND status='active' ORDER BY id DESC LIMIT 1",
         (coin,)
     ).fetchone()
     if row:
-        conn.close()
+        if own_conn:
+            conn.close()
         return row[0]
     # Create initial run
     rs = get_risk_settings()
@@ -726,10 +739,11 @@ def get_active_run_id(coin):
         INSERT INTO paper_runs (name, coin, status, starting_capital, current_capital, config_snapshot, started_at, created_at)
         VALUES (?, ?, 'active', ?, ?, ?, ?, ?)
     """, (f"{coin} Run 1", coin, STARTING_CAPITAL, STARTING_CAPITAL, snap, now_cst().isoformat(), now_cst().isoformat()))
-
-    conn.commit()
+    if own_conn:
+        conn.commit()
     run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.close()
+    if own_conn:
+        conn.close()
     return run_id
 
 def archive_run(coin, reason="manual"):
@@ -825,7 +839,26 @@ Respond with JSON only, no explanation:
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
-            return json.loads(text.strip())
+            text = text.strip()
+            # Try direct parse first
+            try:
+                return json.loads(text)
+            except Exception:
+                pass
+            # Fallback: extract fields via regex (handles truncated JSON from M2.7)
+            import re
+            dir_m  = re.search(r'"direction"\s*:\s*"(YES|NO)"', text)
+            ent_m  = re.search(r'"entry"\s*:\s*([0-9.]+)', text)
+            conf_m = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+            rat_m  = re.search(r'"rationale"\s*:\s*"([^"]*)', text)
+            if dir_m and ent_m:
+                return {
+                    "direction":  dir_m.group(1),
+                    "entry":      float(ent_m.group(1)),
+                    "confidence": float(conf_m.group(1)) if conf_m else 0.5,
+                    "rationale":  rat_m.group(1)[:80] if rat_m else "parsed from partial response",
+                }
+            return None
     except Exception as e:
         print(f"[MINIMAX] {coin}: {e}")
         return None
@@ -852,13 +885,14 @@ def resolve_trades():
 
     for t in trades:
         tid, coin, wts, direction, entry, size, contracts, coin_open = t
-        coin_close = get_price_at(conn, coin, wts + 900)
+        coin_close = get_price_at(conn, coin, wts + 900, tol=600)
         if not coin_close or not coin_open:
             continue
         actual = "YES" if coin_close > coin_open else "NO"
         if direction == actual:
             gross = contracts * (1.0 - entry)
-            fee_per = min(KALSHI_FEE_RATE * (1.0 - entry), 0.02)
+            # Correct Kalshi fee: 7% of entry*(1-entry) per contract, capped at $0.02/contract
+            fee_per = min(KALSHI_FEE_RATE * entry * (1.0 - entry), 0.02)
             fee = contracts * fee_per
             pnl = gross - fee
             result = "WIN"
@@ -878,7 +912,7 @@ def resolve_trades():
                   now_cst().isoformat(), coin))
             # Update active paper run
             try:
-                run_id = get_active_run_id(coin)
+                run_id = get_active_run_id(coin, conn)
                 conn.execute("""
                     UPDATE paper_runs SET current_capital=?,
                     wins = wins + ?, losses = losses + ?,
@@ -937,14 +971,14 @@ def decision_loop():
                         result = run_engine(get_engine_for_coin(coin), coin, mkt, ticks, coin_price, ticks_summary)
 
                     if not result:
-                        yes_bid = mkt.get("yes_bid", 0)
-                        yes_ask = mkt.get("yes_ask", 0)
-                        if yes_ask >= 0.50:
-                            result = {"direction": "YES", "entry": yes_ask, "confidence": 0.5, "rationale": "Market favors YES (fallback)"}
-                        elif yes_bid > 0:
-                            result = {"direction": "NO", "entry": round(1.0 - yes_bid, 4), "confidence": 0.5, "rationale": "Market favors NO (fallback)"}
-                        else:
-                            continue
+                        # Fallback disabled — 160 fallback trades were net negative on every coin
+                        conn.execute("""
+                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (coin, wts, "PASS", 0.5, 0.0, "Engine returned no signal — fallback disabled", now_cst().isoformat()))
+                        conn.commit()
+                        print(f"[DECISION] {coin} wts={wts}: PASS (no engine signal)")
+                        continue
 
                     direction  = result.get("direction", "")
                     entry      = float(result.get("entry", 0))
@@ -978,8 +1012,9 @@ def decision_loop():
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (coin, wts, direction, round(entry, 4), confidence, rationale, now_cst().isoformat()))
 
-                    contracts = size / entry
-                    run_id = get_active_run_id(coin)
+                    contracts = min(size / entry, MAX_CONTRACTS)
+                    size = contracts * entry  # recalculate actual cost after cap
+                    run_id = get_active_run_id(coin, conn)
 
                     conn.execute("""
                         INSERT OR IGNORE INTO paper_trades
@@ -1228,6 +1263,8 @@ def run_replay(coin, engine_key, start_ts, end_ts, starting_capital=100.0, run_n
         entry     = float(result.get("entry", 0))
         if direction not in ("YES","NO") or entry <= 0 or entry >= 1.0:
             continue
+        if entry < ENTRY_FLOOR or entry > ENTRY_CEILING:
+            continue
 
         # Actual outcome: was price higher at close?
         if coin_price_open <= 0 or coin_price_close <= 0:
@@ -1235,11 +1272,11 @@ def run_replay(coin, engine_key, start_ts, end_ts, starting_capital=100.0, run_n
         actual = "YES" if coin_price_close > coin_price_open else "NO"
 
         size      = min(20.0, balance * 0.10)
-        contracts = size / entry
+        contracts = min(size / entry, MAX_CONTRACTS)
+        size      = contracts * entry  # actual cost after cap
         if direction == actual:
             profit = contracts * (1.0 - entry)
-            import math as _math
-            fee = contracts * min(0.07 * (1.0 - entry), 0.02)
+            fee = contracts * min(KALSHI_FEE_RATE * entry * (1.0 - entry), 0.02)
             net = profit - fee
             result_str = "WIN"; wins += 1
         else:
@@ -1356,6 +1393,7 @@ TOOLTIPS = {
     "entry_vs_edge":        "Your entry price affects profitability. Lower entry = higher payout if you win but harder to win. EV (expected value) after Kalshi fees shown per entry price bucket.",
     "ev":                   "Expected Value: the average profit per $1 risked. EV > 0 means you should trade this bucket; EV < 0 means avoid it even with a high win rate (fees eat the edge).",
     "prob_bar":             "Visual indicator of Kalshi market probability. Shaded region = bid→ask spread. White line = midpoint. Blue triangle = Polymarket price. Green = YES-leaning (>55%), Red = NO-leaning (<45%).",
+    "ex_outlier":           "P&L excluding the top 3 biggest wins. Strips lucky outlier trades to show the underlying strategy performance. Negative = the strategy loses money without lucky strikes.",
     # Engine manager
     "engine_minimax_llm":   "Calls MiniMax API each window with tick history + coin price as context. Highest quality, uses API tokens (~$0.001/call). Best when you have reliable API access.",
     "engine_rules":         "Pure rules: if Kalshi mid > 0.62 bet YES, if mid < 0.38 bet NO, else skip. Zero API calls. Fast. Works best in strongly trending markets. May overtrade in sideways conditions.",
@@ -1400,20 +1438,20 @@ def prob_bar(yes_bid, yes_ask, poly_price=None):
         if poly_price:
             pp = float(poly_price)
             poly_marker = f'<div style="position:absolute;left:{int(pp*100)}%;top:-3px;width:2px;height:calc(100%+6px);background:#58a6ff;z-index:2" title="Polymarket: {pp:.3f}"></div>'
-        return f'''<div style="position:relative;height:10px;background:#21262d;border-radius:4px;overflow:visible" title="Kalshi: bid={yb:.3f} ask={ya:.3f} mid={mid:.3f}">
+        poly_title = f" | Polymarket: {float(poly_price):.3f}" if poly_price else ""
+        return f'''<div style="position:relative;height:10px;background:#21262d;border-radius:4px;overflow:hidden" title="Kalshi: bid={yb:.3f} ask={ya:.3f} mid={mid:.3f}{poly_title}">
   <div style="position:absolute;left:{bid_pct}%;width:{spread_w}%;height:100%;background:{spread_color};opacity:0.7;border-radius:3px"></div>
-  <div style="position:absolute;left:{mid_pct}%;top:-2px;width:2px;height:calc(100%+4px);background:#fff;opacity:0.6"></div>
+  <div style="position:absolute;left:{mid_pct}%;top:0;width:2px;height:100%;background:#fff;opacity:0.6"></div>
   {poly_marker}
-  <div style="position:absolute;right:0;top:12px;font-size:9px;color:#555;white-space:nowrap">{mid_pct}%</div>
-</div>'''
+</div><div style="font-size:9px;color:#555;text-align:right;margin-top:1px">{mid_pct}%</div>'''
     except Exception:
         return ""
 
 TOOLTIP_CSS = """
-  .tt { color: #58a6ff; cursor: help; font-size: 11px; margin-left: 4px; user-select: none; }
+  .tt { color: #58a6ff; cursor: help; font-size: 11px; margin-left: 4px; user-select: none; position: relative; }
   .tt:hover::after {
     content: attr(data-tip);
-    position: absolute;
+    position: fixed;
     background: #1c2128;
     border: 1px solid #444;
     border-radius: 6px;
@@ -1422,13 +1460,13 @@ TOOLTIP_CSS = """
     color: #e6edf3;
     max-width: 280px;
     white-space: normal;
-    z-index: 999;
-    margin-top: 20px;
-    margin-left: -140px;
+    z-index: 9999;
+    transform: translateX(-50%);
+    margin-top: 4px;
     line-height: 1.5;
     box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+    pointer-events: none;
   }
-  .tt { position: relative; }
 """
 
 # ── Shared page chrome ──────────────────────────────────────────────────────────
@@ -1446,8 +1484,9 @@ SHARED_CSS = """
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
   .content { padding: 20px; max-width: 1600px; margin: 0 auto; }
   .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+  .row > * { min-width: 0; }
   @media (max-width: 500px)  { .row { grid-template-columns: repeat(2, 1fr); } }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; position: relative; }
   .card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
   .coin-badge { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; }
   .coin-name { font-size: 18px; font-weight: 700; }
@@ -1696,9 +1735,9 @@ def build_onboarding_page(step=1, error="", msg=""):
 {err_html}{msg_html}
 <form method="POST" action="/onboarding/step/3">
   <div class="form-row"><span class="form-label">Starting Capital / coin ($)</span><input type="number" name="starting_capital" value="500" step="50" style="width:120px"></div>
-  <div class="form-row"><span class="form-label">Trade Size ($)</span><input type="number" name="trade_size" value="20" step="5" style="width:120px"></div>
-  <div class="form-row"><span class="form-label">Daily Loss Limit ($)</span><input type="number" name="daily_loss_limit" value="100" step="10" style="width:120px"></div>
-  <div class="form-row"><span class="form-label">Max Drawdown (%)</span><input type="number" name="max_drawdown_pct" value="30" step="5" style="width:120px"></div>
+  <div class="form-row"><span class="form-label">Trade Size ($)</span><input type="number" name="trade_size" value="20" step="1" style="width:120px"></div>
+  <div class="form-row"><span class="form-label">Daily Loss Limit ($)</span><input type="number" name="daily_loss_limit" value="100" step="1" style="width:120px"></div>
+  <div class="form-row"><span class="form-label">Max Drawdown (%)</span><input type="number" name="max_drawdown_pct" value="30" step="1" style="width:120px"></div>
   <div style="margin-top:20px">
     <button class="btn btn-primary" type="submit">Next →</button>
     <a href="/onboarding?step=2"><button class="btn" type="button" style="margin-left:8px">← Back</button></a>
@@ -1769,6 +1808,33 @@ def build_dashboard(user=None):
             WHERE coin=? AND result IS NULL ORDER BY window_ts DESC LIMIT 1
         """, (coin,)).fetchone()
         open_trades[coin] = row
+    # Per-coin EV (win_rate * avg_win_profit - loss_rate * avg_loss, fee-adjusted)
+    coin_ev = {}
+    for coin in COINS:
+        ev_rows = conn.execute("""
+            SELECT result, entry, pnl FROM paper_trades
+            WHERE coin=? AND result IN ('WIN','LOSS') AND entry > 0 AND pnl IS NOT NULL
+            ORDER BY window_ts DESC LIMIT 30
+        """, (coin,)).fetchall()
+        if ev_rows:
+            wins_ev   = [r for r in ev_rows if r[0]=='WIN']
+            losses_ev = [r for r in ev_rows if r[0]=='LOSS']
+            wr = len(wins_ev)/len(ev_rows)
+            avg_win  = sum(r[2] for r in wins_ev)/len(wins_ev) if wins_ev else 0
+            avg_loss = sum(r[2] for r in losses_ev)/len(losses_ev) if losses_ev else 0
+            ev = wr * avg_win + (1-wr) * avg_loss
+            coin_ev[coin] = (ev, len(ev_rows), wr)
+    # Ex-outlier P&L: total minus top 3 wins (shows real performance without lucky strikes)
+    coin_ex_outlier = {}
+    for coin in COINS:
+        all_pnl = conn.execute("""
+            SELECT pnl FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS')
+            ORDER BY pnl DESC
+        """, (coin,)).fetchall()
+        if all_pnl:
+            total = sum(r[0] or 0 for r in all_pnl)
+            top3  = sum(r[0] or 0 for r in all_pnl[:3])
+            coin_ex_outlier[coin] = (total, total - top3, top3)
     # Live toggle state
     state = conn.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
     live_on = state and state[0] == 1
@@ -1821,20 +1887,28 @@ def build_dashboard(user=None):
             open_badge = f'<a href="/coin/{coin}" style="text-decoration:none"><span class="badge badge-open" title="Active paper bet — click for details">{d2} @ {e2:.3f} &nbsp;${sz2:.0f} stake</span></a>'
         else:
             open_badge = '<span class="muted" style="font-size:12px">no open bet</span>'
-        body += f"""<a href="/coin/{coin}" style="text-decoration:none"><div class="card" style="cursor:pointer;transition:border-color 0.15s" onmouseover="this.style.borderColor='{color}'" onmouseout="this.style.borderColor=''">
+        ev_data = coin_ev.get(coin)
+        if ev_data:
+            ev_val, ev_n, ev_wr = ev_data
+            ev_cls = "green" if ev_val > 0.02 else "red" if ev_val < -0.02 else "yellow"
+            ev_bar_w = min(abs(ev_val) * 400, 100)
+            ev_bar_col = "#238636" if ev_val > 0 else "#da3633"
+            ev_html = f'<div style="margin:5px 0 2px 0"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:10px;color:#8b949e">Edge</span><div style="flex:1;height:4px;background:#21262d;border-radius:2px"><div style="width:{ev_bar_w:.0f}%;height:100%;background:{ev_bar_col};border-radius:2px"></div></div><span style="font-size:10px;font-weight:700" class="{ev_cls}">EV {ev_val:+.3f}</span>{tooltip_html("edge")}</div></div>'
+        else:
+            ev_html = '<div style="margin:5px 0 2px 0;font-size:10px;color:#555">Edge — no data yet</div>'
+        body += f"""<div class="card" style="cursor:pointer;transition:border-color 0.15s" onclick="window.location='/coin/{coin}'" onmouseover="this.style.borderColor='{color}'" onmouseout="this.style.borderColor=''">
   <div class="card-header">
     <div class="coin-badge" style="background:{color}">{letter}</div>
-    <div><div class="coin-name">{coin}</div><div class="mkt-ticker">{ticker}</div></div>
-    <div style="margin-left:auto;text-align:right"><div class="price">{price_str}</div></div>
+    <div><div class="coin-name">{coin}</div><div class="mkt-ticker" style="font-size:10px">{ticker}</div></div>
+    <div style="margin-left:auto;text-align:right"><div class="price" style="font-size:15px;color:{'#3fb950' if total_pnl>=0 else '#f85149'}">${capital:.2f}</div><div style="font-size:10px;color:#8b949e">{price_str}</div></div>
   </div>
   <div class="stat-row"><span class="stat-label">Kalshi Bid/Ask</span><span class="stat-value">{yes_bid:.3f} / {yes_ask:.3f}</span></div>
-  <div style="margin:4px 0 6px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:9px;color:#555;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
-  <div class="stat-row"><span class="stat-label">Polymarket YES</span><span class="stat-value muted">{poly_str}</span></div>
-  <div class="stat-row"><span class="stat-label">Paper Capital</span><span class="stat-value">${capital:.2f}</span></div>
-  <div class="stat-row"><span class="stat-label">Total P&amp;L</span><span class="stat-value {pnl_cls}">${total_pnl:+.2f}</span></div>
-  <div class="stat-row"><span class="stat-label">W / L / Rate</span><span class="stat-value">{wins}/{losses} &nbsp; {win_rate}</span></div>
-  <div style="margin-top:8px">{open_badge}</div>
-</div></a>
+  <div style="margin:4px 0 2px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:9px;color:#555;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
+  {ev_html}
+  <div class="stat-row"><span class="stat-label">P&amp;L / Rate</span><span class="stat-value"><span class="{pnl_cls}">${total_pnl:+.2f}</span> &nbsp; {win_rate}</span></div>
+  <div class="stat-row" style="font-size:10px"><span class="stat-label" style="color:#555">ex-outlier P&amp;L {tooltip_html("ex_outlier")}</span><span class="stat-value" style="font-size:10px"><span class="{'green' if (coin_ex_outlier.get(coin,(0,0,0))[1])>=0 else 'red'}">${coin_ex_outlier.get(coin,(0,0,0))[1]:+.2f}</span></span></div>
+  <div style="margin-top:8px" onclick="event.stopPropagation()">{open_badge}</div>
+</div>
 """
     body += '</div>\n<div class="section-title">Recent Trades</div>\n'
     for coin in COINS:
@@ -2244,8 +2318,8 @@ def build_settings_page(user=None, msg=""):
     body += '<div class="section-title">Paper Trading</div>\n<div class="card">\n'
     body += f'''<form method="POST" action="/settings/save">
 <div class="form-row"><span class="form-label">Starting Capital / coin</span><input type="number" name="starting_capital" value="{settings.get('starting_capital', 500)}" step="10" style="width:100px"></div>
-<div class="form-row"><span class="form-label">Min Stake ($)</span><input type="number" name="min_stake" value="{settings.get('min_stake', 20)}" step="5" style="width:100px"></div>
-<div class="form-row"><span class="form-label">Max Stake ($)</span><input type="number" name="max_stake" value="{settings.get('max_stake', 30)}" step="5" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Min Stake ($)</span><input type="number" name="min_stake" value="{settings.get('min_stake', 20)}" step="1" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Max Stake ($)</span><input type="number" name="max_stake" value="{settings.get('max_stake', 30)}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Decision Model</span><input type="text" name="model" value="{settings.get('model', get_minimax_model())}" style="width:220px">
 <span class="muted" style="font-size:11px;margin-left:8px">MiniMax-M2.5 recommended — fast, no thinking overhead. M2.7 works but adds ~5s latency per decision.</span></div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Settings</button></div>
@@ -2264,9 +2338,9 @@ def build_settings_page(user=None, msg=""):
     <option value="1" {"selected" if ks else ""}>ON</option>
   </select>
 </div>
-<div class="form-row"><span class="form-label">Daily Loss Limit ($) {tooltip_html("daily_loss_limit")}</span><input type="number" name="daily_loss_limit" value="{rs['daily_loss_limit']:.0f}" step="10" style="width:100px"></div>
-<div class="form-row"><span class="form-label">Max Drawdown (%) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_drawdown_pct" value="{rs['max_drawdown_pct']*100:.0f}" step="5" style="width:100px"></div>
-<div class="form-row"><span class="form-label">Max Stake ($) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_stake" value="{rs['max_stake']:.0f}" step="5" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Daily Loss Limit ($) {tooltip_html("daily_loss_limit")}</span><input type="number" name="daily_loss_limit" value="{rs['daily_loss_limit']:.0f}" step="1" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Max Drawdown (%) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_drawdown_pct" value="{rs['max_drawdown_pct']*100:.0f}" step="1" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Max Stake ($) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_stake" value="{rs['max_stake']:.0f}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Cooldown After N Losses {tooltip_html("cooldown_after_losses")}</span><input type="number" name="cooldown_after_losses" value="{rs['cooldown_after_losses']}" step="1" min="0" style="width:100px"></div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Risk Settings</button></div>
 </form>'''
@@ -2711,7 +2785,22 @@ Paper account balances:
 {chr(10).join(acct_lines) or "  None yet"}
 
 Risk settings: {rs_s}
-Active model: {get_minimax_model()} | Fee: {KALSHI_FEE_RATE*100:.0f}% of profit (cap $0.02/contract)
+Active model: {get_minimax_model()} | Fee: {KALSHI_FEE_RATE*100:.0f}% of entry*(1-entry)/contract (cap $0.02/contract)
+Entry floor: {ENTRY_FLOOR} | Entry ceiling: {ENTRY_CEILING} | Max contracts: {MAX_CONTRACTS}
+
+=== RISK GUARDRAILS ===
+- Entry floor {ENTRY_FLOOR}: entries below this are blocked — they produce unrealistic contract counts (e.g. 38,000 contracts at $0.001) that can never fill at real Kalshi order book depth.
+- Entry ceiling {ENTRY_CEILING}: entries above this are blocked — confirmed negative EV across all 4 coins (42% win rate, -$1,673 total in backtests).
+- Max contracts {MAX_CONTRACTS}: cap on contracts per trade to reflect realistic order book liquidity.
+- Fallback disabled: when the decision engine returns no signal, the system now records a PASS instead of blindly following market price. Fallback had 36-48% win rate across all coins.
+- Ex-outlier P&L: shown on each coin card — total P&L minus the top 3 biggest wins. This strips lucky tail events to show underlying strategy performance. If negative, the strategy loses money without lucky strikes.
+- Fee formula: corrected to min(0.07 * entry * (1-entry), 0.02) * contracts per Kalshi's official formula.
+
+=== COIN PERFORMANCE NOTES (from analysis) ===
+- XRP: most balanced YES/NO, best candidate for refinement. Both directions contribute.
+- BTC: wins dominated by cheap-entry tail events (now blocked by entry floor). Normal trade quality unproven.
+- SOL: NO-collapse setups most promising. YES side weak (41% WR historically).
+- ETH: weakest general performance. Cooldown/pass mechanism firing correctly and preventing losses.
 
 Answer the user's question concisely using the above context. If asked about a specific page or feature, explain it clearly."""
 
@@ -3332,6 +3421,24 @@ def build_coin_page(coin, user=None):
         SELECT ts, window_ts, yes_bid, yes_ask, coin_price FROM kalshi_ticks
         WHERE coin=? ORDER BY ts DESC LIMIT 20
     """, (coin,)).fetchall()
+    # Insights data for this coin
+    dir_stats = conn.execute("""
+        SELECT direction, COUNT(*) as total, SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+               AVG(pnl) as avg_pnl
+        FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS')
+        GROUP BY direction
+    """, (coin,)).fetchall()
+    entry_stats = conn.execute("""
+        SELECT ROUND(entry,1) as bucket, COUNT(*) as total,
+               SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) as wins,
+               AVG(pnl) as avg_pnl
+        FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS') AND entry > 0
+        GROUP BY bucket ORDER BY bucket
+    """, (coin,)).fetchall()
+    pnl_trend = conn.execute("""
+        SELECT window_ts, pnl, result FROM paper_trades
+        WHERE coin=? AND result IN ('WIN','LOSS') ORDER BY window_ts DESC LIMIT 20
+    """, (coin,)).fetchall()
     conn.close()
 
     with _state_lock:
@@ -3378,14 +3485,19 @@ def build_coin_page(coin, user=None):
     else:
         body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Conf</th><th>Rationale</th><th>Result</th><th>P&L</th></tr>\n'
         for wts, direction, entry, conf, rationale, result, pnl in decisions:
-            t_s   = ts_cst(wts).strftime("%m/%d %H:%M") if wts else "?"
+            t_s    = ts_cst(wts).strftime("%m/%d %H:%M") if wts else "?"
             conf_s = f"{conf:.0%}" if conf else "—"
-            bc    = "badge-win" if result=="WIN" else "badge-loss" if result=="LOSS" else "badge-pass" if direction=="PASS" else "badge-open"
-            res_s = result or ("PASS" if direction=="PASS" else "OPEN")
+            rat    = rationale or ""
+            is_fallback = "fallback" in rat.lower() or "Market favors" in rat
+            is_blocked  = direction == "PASS"
+            bc    = "badge-win" if result=="WIN" else "badge-loss" if result=="LOSS" else "badge-pass" if is_blocked else "badge-open"
+            res_s = result or ("PASS" if is_blocked else "OPEN")
             pnl_s = f"${pnl:+.2f}" if pnl is not None else "—"
             pnl_c2 = "green" if (pnl or 0)>0 else "red" if (pnl or 0)<0 else "muted"
-            body += f'<tr><td>{t_s}</td><td>{direction}</td><td>{entry:.3f}</td><td>{conf_s}</td>'
-            body += f'<td class="muted" style="font-size:11px">{(rationale or "")[:50]}</td>'
+            row_style = ' style="opacity:0.5"' if is_fallback else ""
+            fallback_tag = ' <span style="font-size:9px;color:#f85149;font-weight:700">FALLBACK</span>' if is_fallback else ""
+            body += f'<tr{row_style}><td>{t_s}</td><td>{direction}{fallback_tag}</td><td>{entry:.3f}</td><td>{conf_s}</td>'
+            body += f'<td class="muted" style="font-size:11px">{rat[:60]}</td>'
             body += f'<td><span class="badge {bc}">{res_s}</span></td><td class="{pnl_c2}">{pnl_s}</td></tr>\n'
         body += '</table>\n'
     body += '</div>\n'
@@ -3407,6 +3519,61 @@ def build_coin_page(coin, user=None):
             body += f'<td>{co_s}→{cc_s}</td><td class="{pc}">{pnl_s}</td><td><span class="badge {bc}">{result or "OPEN"}</span></td></tr>\n'
         body += '</table>\n'
     body += '</div>\n'
+
+    # Insights
+    body += '<div class="section-title">Insights</div>\n'
+    if not dir_stats and not entry_stats:
+        body += '<div class="card"><div class="muted">No completed trades yet — insights appear after first resolved window.</div></div>\n'
+    else:
+        body += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">\n'
+        # Direction breakdown
+        body += '<div class="card">\n<div style="font-weight:600;margin-bottom:10px;font-size:13px">Direction Breakdown</div>\n'
+        if dir_stats:
+            body += '<table class="trade-table"><tr><th>Dir</th><th>Trades</th><th>Win%</th><th>Avg P&L</th><th>Signal</th></tr>\n'
+            for direction, total, wins, avg_pnl in dir_stats:
+                wr = (wins or 0)/total if total else 0
+                sig = "Prefer" if wr > 0.52 else "Avoid" if wr < 0.45 else "Neutral"
+                sc  = "green" if sig=="Prefer" else "red" if sig=="Avoid" else "yellow"
+                body += f'<tr><td><strong>{direction}</strong></td><td>{total}</td>'
+                body += f'<td class="{"green" if wr>0.5 else "red"}">{wr:.0%}</td>'
+                body += f'<td class="{"green" if (avg_pnl or 0)>=0 else "red"}">${(avg_pnl or 0):+.2f}</td>'
+                body += f'<td class="{sc}">{sig}</td></tr>\n'
+            body += '</table>\n'
+        else:
+            body += '<div class="muted" style="font-size:12px">No data</div>\n'
+        body += '</div>\n'
+        # P&L trend sparkline (text)
+        body += '<div class="card">\n<div style="font-weight:600;margin-bottom:10px;font-size:13px">Recent P&L (last 20)</div>\n'
+        if pnl_trend:
+            rows_rev = list(reversed(pnl_trend))
+            cum = 0.0
+            body += '<div style="display:flex;flex-wrap:wrap;gap:3px;align-items:flex-end;margin-bottom:8px">\n'
+            for wts_t, pnl_t, res_t in rows_rev:
+                h = min(int(abs(pnl_t or 0) * 3 + 4), 28)
+                c = "#238636" if (pnl_t or 0) >= 0 else "#da3633"
+                cum += float(pnl_t or 0)
+                body += f'<div style="width:8px;height:{h}px;background:{c};border-radius:2px" title="{res_t} ${(pnl_t or 0):+.2f}"></div>\n'
+            body += '</div>\n'
+            body += f'<div style="font-size:12px">Running P&L: <span class="{"green" if cum>=0 else "red"}">${cum:+.2f}</span></div>\n'
+        else:
+            body += '<div class="muted" style="font-size:12px">No data</div>\n'
+        body += '</div>\n'
+        body += '</div>\n'
+        # Entry vs EV
+        if entry_stats:
+            body += '<div class="card" style="margin-bottom:16px">\n<div style="font-weight:600;margin-bottom:10px;font-size:13px">Entry Price vs EV {}</div>\n'.format(tooltip_html("entry_vs_edge"))
+            body += '<table class="trade-table"><tr><th>Entry</th><th>Trades</th><th>Win%</th><th>Avg P&L</th><th>Fee-adj EV</th></tr>\n'
+            for bucket, total, wins, avg_pnl in entry_stats:
+                if total < 2: continue
+                wr = (wins or 0)/total if total else 0
+                e  = float(bucket or 0.5)
+                ev = wr*(1-e)*(1-KALSHI_FEE_RATE) - (1-wr)*e
+                ec = "green" if ev>0.01 else "yellow" if ev>-0.01 else "red"
+                body += f'<tr><td>{e:.2f}</td><td>{total}</td>'
+                body += f'<td class="{"green" if wr>0.5 else "red"}">{wr:.0%}</td>'
+                body += f'<td class="{"green" if (avg_pnl or 0)>=0 else "red"}">${(avg_pnl or 0):+.2f}</td>'
+                body += f'<td class="{ec}">EV {ev:+.3f}</td></tr>\n'
+            body += '</table>\n</div>\n'
 
     # Live ticks
     body += '<div class="section-title">Live Ticks</div>\n<div class="card">\n'
