@@ -1079,7 +1079,8 @@ def get_price_at(conn, coin, ts, tol=120):
     """, (coin, ts, tol, ts)).fetchone()
     return row[0] if row else None
 
-def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None, rules_signal=None, knn_signal=None):
+def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None,
+                    rules_signal=None, knn_signal=None, price_momentum=None):
     if not MINIMAX_KEY:
         return None
     vol_line = ""
@@ -1089,42 +1090,78 @@ def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=
     spread_line = ""
     if spread is not None:
         spread_line = f"\nCurrent bid-ask spread: {spread:.3f} ({'tight' if spread < 0.05 else 'wide — slippage risk'})"
-    # Build quantitative signal context from rules and KNN
-    quant_lines = []
+
+    # Build engine results block
+    engine_lines = []
+    agreement_count = {"YES": 0, "NO": 0}
+
     if rules_signal:
-        rd = rules_signal.get("direction")
+        rd = rules_signal.get("direction", "PASS")
         re_ = rules_signal.get("entry", 0)
+        rc = rules_signal.get("confidence", 0)
         mid = re_ if rd == "YES" else round(1 - re_, 3)
-        quant_lines.append(f"Rules engine (order book mid): {rd} — market mid={mid:.3f} ({'above 0.62 YES threshold' if mid > 0.62 else 'below 0.38 NO threshold' if mid < 0.38 else 'neutral zone'})")
+        zone = "above 0.62 YES threshold" if mid > 0.62 else ("below 0.38 NO threshold" if mid < 0.38 else "neutral zone")
+        engine_lines.append(f"- Rules engine:    {rd:4s}  entry={re_:.3f}  conf={rc:.2f}  (market mid={mid:.3f}, {zone})")
+        if rd in ("YES", "NO"):
+            agreement_count[rd] += 1
+    else:
+        engine_lines.append(f"- Rules engine:    PASS  (market mid in neutral zone 0.38–0.62, no strong order book signal)")
+
     if knn_signal:
-        kd = knn_signal.get("direction")
+        kd = knn_signal.get("direction", "PASS")
+        ke = knn_signal.get("entry", 0)
         kc = knn_signal.get("confidence", 0)
         kr = knn_signal.get("rationale", "")
-        quant_lines.append(f"KNN pattern match: {kd} — {kr} (confidence={kc:.2f})")
-    if not quant_lines:
-        quant_block = ""
+        engine_lines.append(f"- KNN (historical): {kd:4s}  entry={ke:.3f}  conf={kc:.2f}  ({kr})")
+        if kd in ("YES", "NO"):
+            agreement_count[kd] += 1
     else:
-        quant_block = "\n\nQuantitative signals (computed from live order book + historical patterns):\n" + "\n".join(f"- {l}" for l in quant_lines) + "\nThese are data-driven inputs. Use them as evidence but apply your own judgment — override with clear reasoning if your analysis disagrees."
-    prompt = f"""You are a quantitative analyst evaluating a 15-minute {coin} price direction signal.
+        engine_lines.append(f"- KNN (historical): insufficient resolved history for this coin")
+
+    if price_momentum is not None:
+        pct = price_momentum * 100
+        trend = "bullish" if pct > 0.1 else ("bearish" if pct < -0.1 else "flat")
+        engine_lines.append(f"- Price momentum:  {'+' if pct>=0 else ''}{pct:.2f}% over last 5 min ({trend})")
+        if pct > 0.15:
+            agreement_count["YES"] += 1
+        elif pct < -0.15:
+            agreement_count["NO"] += 1
+
+    # Consensus summary
+    yes_n, no_n = agreement_count["YES"], agreement_count["NO"]
+    if yes_n >= 2 and no_n == 0:
+        consensus = f"STRONG CONSENSUS: all {yes_n} signals point YES — override requires explicit reasoning"
+    elif no_n >= 2 and yes_n == 0:
+        consensus = f"STRONG CONSENSUS: all {no_n} signals point NO — override requires explicit reasoning"
+    elif yes_n > 0 and no_n > 0:
+        consensus = f"MIXED SIGNALS: {yes_n} YES vs {no_n} NO — use your judgment, lower confidence is appropriate"
+    else:
+        consensus = "WEAK/NO CONSENSUS: limited quantitative signal, rely on order book analysis"
+
+    engine_block = ("\n\nEngine results (pre-computed before your analysis):\n"
+                    + "\n".join(engine_lines)
+                    + f"\nConsensus: {consensus}")
+
+    prompt = f"""You are the final decision-maker in a multi-engine prediction market trading system for 15-minute {coin} price contracts.
 
 Current {coin} spot price: ${coin_price:,.2f}{vol_line}{spread_line}
 
 Order book snapshots from the last 5 minutes (yes_bid = probability market pays for UP outcome, yes_ask = cost to acquire UP position):
-{ticks_summary}{quant_block}
+{ticks_summary}{engine_block}
 
-Task: Predict whether {coin} price will be HIGHER or LOWER in 15 minutes.
-- If HIGHER: direction=YES, entry=yes_ask value
-- If LOWER: direction=NO, entry=(1 - yes_bid) value
-- Factor in volume: low-volume markets have weaker price discovery and higher reversal risk.
-- Wide spreads increase slippage cost — only trade if conviction is high.
-- If quantitative signals above strongly agree on a direction, weight that heavily.
+Your task: Synthesize all available signals and make the final trading decision.
+- If HIGHER: direction=YES, entry=yes_ask value from the order book above
+- If LOWER: direction=NO, entry=(1 - yes_bid) value from the order book above
+- Strong consensus from multiple engines = high confidence. Mixed signals = lower confidence or PASS.
+- You may suggest a better engine for this coin/market state via suggest_engine field.
+- Wide spreads and low volume increase risk — reduce confidence accordingly.
 
-Respond with JSON only, no explanation:
-{{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line technical reason"}}"""
+Respond with JSON only:
+{{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line synthesis of signals", "suggest_engine": null or "rules_engine" or "vector_knn" or "hybrid"}}"""
 
     payload = json.dumps({
         "model": get_minimax_model(),
-        "max_tokens": 4096,   # M2.7 uses ~700 tokens on thinking before emitting the JSON answer
+        "max_tokens": 4096,
         "messages": [{"role": "user", "content": prompt}]
     }).encode()
 
@@ -1147,25 +1184,31 @@ Respond with JSON only, no explanation:
                 if text.startswith("json"):
                     text = text[4:]
             text = text.strip()
-            # Try direct parse first
             try:
-                return json.loads(text)
+                result = json.loads(text)
             except Exception:
-                pass
-            # Fallback: extract fields via regex (handles truncated JSON from M2.7)
-            import re
-            dir_m  = re.search(r'"direction"\s*:\s*"(YES|NO)"', text)
-            ent_m  = re.search(r'"entry"\s*:\s*([0-9.]+)', text)
-            conf_m = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
-            rat_m  = re.search(r'"rationale"\s*:\s*"([^"]*)', text)
-            if dir_m and ent_m:
-                return {
-                    "direction":  dir_m.group(1),
-                    "entry":      float(ent_m.group(1)),
-                    "confidence": float(conf_m.group(1)) if conf_m else 0.5,
-                    "rationale":  rat_m.group(1)[:80] if rat_m else "parsed from partial response",
-                }
-            return None
+                # Fallback: extract fields via regex (handles truncated JSON from M2.7)
+                import re
+                dir_m  = re.search(r'"direction"\s*:\s*"(YES|NO)"', text)
+                ent_m  = re.search(r'"entry"\s*:\s*([0-9.]+)', text)
+                conf_m = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+                rat_m  = re.search(r'"rationale"\s*:\s*"([^"]*)', text)
+                sug_m  = re.search(r'"suggest_engine"\s*:\s*"([^"]*)"', text)
+                if dir_m and ent_m:
+                    result = {
+                        "direction":      dir_m.group(1),
+                        "entry":          float(ent_m.group(1)),
+                        "confidence":     float(conf_m.group(1)) if conf_m else 0.5,
+                        "rationale":      rat_m.group(1)[:80] if rat_m else "parsed from partial response",
+                        "suggest_engine": sug_m.group(1) if sug_m else None,
+                    }
+                else:
+                    return None
+            # Log engine suggestion if present
+            sug = result.get("suggest_engine")
+            if sug and sug in ("rules_engine", "vector_knn", "hybrid", "minimax_llm"):
+                print(f"[ENGINE HINT] {coin}: LLM suggests switching to {sug} — {result.get('rationale','')[:60]}")
+            return result
     except Exception as e:
         print(f"[MINIMAX] {coin}: {e}")
         return None
@@ -1392,6 +1435,10 @@ def decision_loop():
                     entry      = float(result.get("entry", 0))
                     confidence = float(result.get("confidence", 0.5))
                     rationale  = result.get("rationale", "")
+                    # Append engine suggestion hint to rationale for audit trail
+                    sug_eng = result.get("suggest_engine")
+                    if sug_eng and sug_eng in ("rules_engine", "vector_knn", "hybrid"):
+                        rationale = rationale.rstrip(".") + f" [suggests: {sug_eng}]"
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
                         print(f"[SKIP] {coin} wts={wts}: bad engine result dir={direction} entry={entry}")
                         return
@@ -1692,12 +1739,21 @@ def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_v
         return vector_knn_engine(coin, mkt, ticks)
     elif engine_key == "hybrid":
         return hybrid_engine(coin, mkt, ticks)
-    else:  # minimax_llm default — enrich with rules + KNN signals
+    else:  # minimax_llm — run all engines first, synthesize with LLM
         rules_sig = rules_engine(coin, mkt)
-        knn_sig = vector_knn_engine(coin, mkt, ticks)
+        knn_sig   = vector_knn_engine(coin, mkt, ticks)
+        # Price momentum: % change over last 5 minutes from tick coin_price
+        price_momentum = None
+        try:
+            prices = [float(t[3]) for t in ticks if t[3]]  # ticks: (wts, yes_bid, yes_ask, coin_price, secs_left)
+            if len(prices) >= 2:
+                price_momentum = (prices[-1] - prices[0]) / prices[0]
+        except Exception:
+            pass
         return minimax_analyze(coin, ticks_summary, coin_price,
                                market_volume=market_volume, spread=spread,
-                               rules_signal=rules_sig, knn_signal=knn_sig)
+                               rules_signal=rules_sig, knn_signal=knn_sig,
+                               price_momentum=price_momentum)
 
 def rules_engine(coin, mkt):
     try:
