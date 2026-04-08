@@ -1153,8 +1153,8 @@ Your task: Synthesize all available signals and make the final trading decision.
 - If HIGHER: direction=YES, entry=yes_ask value from the order book above
 - If LOWER: direction=NO, entry=(1 - yes_bid) value from the order book above
 - Strong consensus from multiple engines = high confidence. Mixed signals = lower confidence or PASS.
-- You may suggest a better engine for this coin/market state via suggest_engine field.
 - Wide spreads and low volume increase risk — reduce confidence accordingly.
+- Only suggest an engine switch if you have strong conviction that a different engine would perform significantly better for THIS coin's current market regime (e.g. strong sustained trend → rules_engine, rich resolved history → vector_knn). Default to null — do NOT suggest a switch just because signals are mixed or uncertain. A suggestion triggers an auto-switch after several consecutive windows, so only suggest when you are confident it will improve results long-term.
 
 Respond with JSON only:
 {{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line synthesis of signals", "suggest_engine": null or "rules_engine" or "vector_knn" or "hybrid"}}"""
@@ -1473,7 +1473,7 @@ def decision_loop():
                     # ── Engine suggestion / auto-switch ─────────────────────────
                     sug_eng = result.get("suggest_engine")
                     VALID_ENGINES = ("rules_engine", "vector_knn", "hybrid", "minimax_llm")
-                    AUTO_SWITCH_THRESHOLD = 3   # consecutive same suggestions to trigger switch
+                    AUTO_SWITCH_THRESHOLD = 8   # consecutive same suggestions to trigger switch
                     AUTO_SWITCH_BACK_WR   = 0.38 # if non-LLM engine WR drops below this, revert
                     try:
                         current_engine = get_engine_for_coin(coin)
