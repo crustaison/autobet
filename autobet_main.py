@@ -536,6 +536,28 @@ def db_init():
             (coin, STARTING_CAPITAL, now_cst().isoformat())
         )
 
+    # Migrate live_orders to correct schema if it has wrong columns (Clyde's version)
+    lo_cols = [r[1] for r in conn.execute("PRAGMA table_info(live_orders)").fetchall()]
+    if "window_ts" not in lo_cols:
+        conn.execute("DROP TABLE IF EXISTS live_orders")
+        conn.execute("""
+            CREATE TABLE live_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coin TEXT NOT NULL,
+                window_ts INTEGER NOT NULL,
+                ticker TEXT,
+                direction TEXT,
+                contracts INTEGER,
+                limit_price INTEGER,
+                order_id TEXT,
+                status TEXT DEFAULT 'placed',
+                error TEXT,
+                filled_contracts INTEGER,
+                avg_fill_price REAL,
+                created_at TEXT
+            )
+        """)
+
     conn.commit()
     conn.close()
     print("[DB] Initialized")
@@ -2557,7 +2579,7 @@ def build_settings_page(user=None, msg=""):
     # Paper trading
     body += '<div class="section-title">Paper Trading</div>\n<div class="card">\n'
     body += f'''<form method="POST" action="/settings/save">
-<div class="form-row"><span class="form-label">Starting Capital / coin</span><input type="number" name="starting_capital" value="{settings.get('starting_capital', 500)}" step="10" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Starting Capital / coin</span><input type="number" name="starting_capital" value="{settings.get('starting_capital', 500)}" step="0.01" style="width:120px"></div>
 <div class="form-row"><span class="form-label">Min Stake ($)</span><input type="number" name="min_stake" value="{settings.get('min_stake', 20)}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Max Stake ($)</span><input type="number" name="max_stake" value="{settings.get('max_stake', 30)}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Decision Model</span><input type="text" name="model" value="{settings.get('model', get_minimax_model())}" style="width:220px">
