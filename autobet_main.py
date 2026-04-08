@@ -2947,7 +2947,9 @@ def build_fill_quality_page(user=None):
     if not liq_rows:
         body += '<div class="card"><p class="muted" style="margin:0">No liquidity check records yet.</p></div>\n'
     else:
-        body += '<div class="card" style="padding:0;overflow:hidden">\n'
+        body += '<div class="card" style="overflow-x:auto">\n'
+        body += '<table class="data-table">\n'
+        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Requested</th><th>Available</th><th>Status</th></tr>\n'
         for r in liq_rows:
             coin, wts, direction, entry, req, avail, filled, liq_ok, created_at = r
             try:
@@ -2956,21 +2958,17 @@ def build_fill_quality_page(user=None):
                 ts = str(wts)
             dir_color = "#3fb950" if direction == "YES" else "#f85149"
             if liq_ok == 1:
-                st_icon, st_color, st_label = "✓", "#3fb950", "OK"
+                status = '<span style="color:#3fb950">✓ OK</span>'
             elif avail is not None and avail < 10:
-                st_icon, st_color, st_label = "✗", "#f85149", "thin"
+                status = '<span style="color:#f85149">✗ thin</span>'
             else:
-                st_icon, st_color, st_label = "~", "#e3b341", "partial"
+                status = '<span style="color:#e3b341">~ partial</span>'
+            req_s   = f"{req:.1f}" if req is not None else "—"
             avail_s = f"{avail:,.0f}" if avail is not None else "—"
-            body += f'''<div style="padding:8px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:12px">
-  <div style="width:72px;font-size:11px;color:#8b949e">{ts}</div>
-  <div style="width:32px;font-size:12px;font-weight:700;color:{COIN_COLORS.get(coin,"#ccc")}">{coin}</div>
-  <div style="width:28px;font-size:11px;font-weight:600;color:{dir_color}">{direction}</div>
-  <div style="width:44px;font-size:11px;color:#ccc">{entry:.3f}</div>
-  <div style="flex:1;font-size:11px;color:#555">{avail_s} avail</div>
-  <div style="width:52px;text-align:right;font-size:11px;font-weight:600;color:{st_color}">{st_icon} {st_label}</div>
-</div>'''
-        body += '</div>\n'
+            body += f'<tr><td>{ts}</td><td style="color:{COIN_COLORS.get(coin,"#ccc")};font-weight:700">{coin}</td>'
+            body += f'<td style="color:{dir_color};font-weight:600">{direction}</td>'
+            body += f'<td>{entry:.3f}</td><td>{req_s}</td><td>{avail_s}</td><td>{status}</td></tr>\n'
+        body += '</table>\n</div>\n'
 
     return page_shell("Fill Quality", "/fill-quality", body, user=user)
 
