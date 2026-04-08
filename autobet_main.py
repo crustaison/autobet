@@ -1154,64 +1154,101 @@ Your task: Synthesize all available signals and make the final trading decision.
 - If LOWER: direction=NO, entry=(1 - yes_bid) value from the order book above
 - Strong consensus from multiple engines = high confidence. Mixed signals = lower confidence or PASS.
 - Wide spreads and low volume increase risk — reduce confidence accordingly.
+- Before finalizing: state the strongest argument AGAINST your chosen direction. If that counter-argument is compelling (e.g. order book strongly disagrees with your direction, or multiple engines conflict), revise your answer or reduce confidence to below 0.55. Do not talk yourself into a trade — if genuinely uncertain, PASS is correct.
 - Only suggest an engine switch if you have strong conviction that a different engine would perform significantly better for THIS coin's current market regime (e.g. strong sustained trend → rules_engine, rich resolved history → vector_knn). Default to null — do NOT suggest a switch just because signals are mixed or uncertain. A suggestion triggers an auto-switch after several consecutive windows, so only suggest when you are confident it will improve results long-term.
 
 Respond with JSON only:
-{{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line synthesis of signals", "suggest_engine": null or "rules_engine" or "vector_knn" or "hybrid"}}"""
+{{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line including what you considered and why you held or revised", "suggest_engine": null or "rules_engine" or "vector_knn" or "hybrid"}}"""
 
-    payload = json.dumps({
-        "model": get_minimax_model(),
-        "max_tokens": 4096,
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode()
+    # Run MiniMax and local 35B in parallel — use both results to validate
+    import threading as _threading
+    results = {}
 
-    req = urllib.request.Request(
-        MINIMAX_URL, data=payload,
-        headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=120) as r:
-            resp = json.loads(r.read().decode())
-            text = ""
-            for block in resp.get("content", []):
-                if block.get("type") == "text":
-                    text = block.get("text", "").strip()
-                    break
-            if not text:
-                return None
-            if "```" in text:
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            text = text.strip()
-            try:
-                result = json.loads(text)
-            except Exception:
-                # Fallback: extract fields via regex (handles truncated JSON from M2.7)
-                import re
-                dir_m  = re.search(r'"direction"\s*:\s*"(YES|NO)"', text)
-                ent_m  = re.search(r'"entry"\s*:\s*([0-9.]+)', text)
-                conf_m = re.search(r'"confidence"\s*:\s*([0-9.]+)', text)
-                rat_m  = re.search(r'"rationale"\s*:\s*"([^"]*)', text)
-                sug_m  = re.search(r'"suggest_engine"\s*:\s*"([^"]*)"', text)
-                if dir_m and ent_m:
-                    result = {
-                        "direction":      dir_m.group(1),
-                        "entry":          float(ent_m.group(1)),
-                        "confidence":     float(conf_m.group(1)) if conf_m else 0.5,
-                        "rationale":      rat_m.group(1)[:80] if rat_m else "parsed from partial response",
-                        "suggest_engine": sug_m.group(1) if sug_m else None,
-                    }
-                else:
-                    return None
-            # Log engine suggestion if present
-            sug = result.get("suggest_engine")
-            if sug and sug in ("rules_engine", "vector_knn", "hybrid", "minimax_llm"):
-                print(f"[ENGINE HINT] {coin}: LLM suggests switching to {sug} — {result.get('rationale','')[:60]}")
-            return result
-    except Exception as e:
-        print(f"[MINIMAX] {coin}: {e} — trying local fallback")
-        return local_llm_analyze(coin, prompt)
+    def _call_minimax():
+        try:
+            payload = json.dumps({
+                "model": get_minimax_model(),
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}]
+            }).encode()
+            req = urllib.request.Request(
+                MINIMAX_URL, data=payload,
+                headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                resp = json.loads(r.read().decode())
+                text = ""
+                for block in resp.get("content", []):
+                    if block.get("type") == "text":
+                        text = block.get("text", "").strip()
+                        break
+                if not text:
+                    return
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                text = text.strip()
+                try:
+                    results["minimax"] = json.loads(text)
+                except Exception:
+                    import re as _re2
+                    dir_m  = _re2.search(r'"direction"\s*:\s*"(YES|NO)"', text)
+                    ent_m  = _re2.search(r'"entry"\s*:\s*([0-9.]+)', text)
+                    conf_m = _re2.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+                    rat_m  = _re2.search(r'"rationale"\s*:\s*"([^"]*)', text)
+                    sug_m  = _re2.search(r'"suggest_engine"\s*:\s*"([^"]*)"', text)
+                    if dir_m and ent_m:
+                        results["minimax"] = {
+                            "direction":      dir_m.group(1),
+                            "entry":          float(ent_m.group(1)),
+                            "confidence":     float(conf_m.group(1)) if conf_m else 0.5,
+                            "rationale":      rat_m.group(1)[:80] if rat_m else "parsed from partial response",
+                            "suggest_engine": sug_m.group(1) if sug_m else None,
+                        }
+        except Exception as e:
+            print(f"[MINIMAX] {coin}: {e}")
+
+    t_mm  = _threading.Thread(target=_call_minimax,  daemon=True)
+    t_loc = _threading.Thread(target=lambda: results.update({"local": local_llm_analyze(coin, prompt)}), daemon=True)
+    t_mm.start()
+    t_loc.start()
+    t_mm.join(timeout=125)
+    t_loc.join(timeout=95)
+
+    mm = results.get("minimax")
+    lo = results.get("local")
+
+    if mm and lo:
+        mm_dir, lo_dir = mm.get("direction"), lo.get("direction")
+        mm_conf, lo_conf = float(mm.get("confidence", 0.5)), float(lo.get("confidence", 0.5))
+        if mm_dir == lo_dir:
+            # Both agree — boost confidence slightly, note in rationale
+            boosted = round(min((mm_conf + lo_conf) / 2 * 1.08, 0.95), 4)
+            mm["confidence"] = boosted
+            mm["rationale"]  = mm["rationale"].rstrip(".") + f" [local agrees {lo_conf:.2f}↑]"
+            print(f"[DUAL LLM] {coin}: AGREE {mm_dir} mm={mm_conf:.2f} local={lo_conf:.2f} → {boosted:.2f}")
+        else:
+            # Disagree — penalize confidence, flag in rationale
+            penalized = round(mm_conf * 0.65, 4)
+            mm["confidence"] = penalized
+            mm["rationale"]  = mm["rationale"].rstrip(".") + f" [local disagrees: {lo_dir} {lo_conf:.2f}↓]"
+            print(f"[DUAL LLM] {coin}: DISAGREE mm={mm_dir}({mm_conf:.2f}) local={lo_dir}({lo_conf:.2f}) → penalized to {penalized:.2f}")
+        result = mm
+    elif mm:
+        print(f"[DUAL LLM] {coin}: MiniMax only (local timed out)")
+        result = mm
+    elif lo:
+        print(f"[DUAL LLM] {coin}: local only (MiniMax failed)")
+        lo["rationale"] = lo.get("rationale","").rstrip(".") + " [local only]"
+        result = lo
+    else:
+        return None
+
+    sug = result.get("suggest_engine")
+    if sug and sug in ("rules_engine", "vector_knn", "hybrid", "minimax_llm"):
+        print(f"[ENGINE HINT] {coin}: LLM suggests switching to {sug} — {result.get('rationale','')[:60]}")
+    return result
 
 def local_llm_analyze(coin, prompt):
     """
