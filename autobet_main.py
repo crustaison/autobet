@@ -2156,10 +2156,11 @@ def build_dashboard(user=None):
     # Per-coin live mode and last live order
     coin_modes_db = {r[0]: r[1] for r in conn.execute("SELECT coin, mode FROM coin_modes").fetchall()}
     coin_last_order = {}
+    recent_cutoff = int(time.time()) - 1800  # only show orders from last 30 min
     for coin in COINS:
         row = conn.execute(
-            "SELECT direction, contracts, status, error, created_at FROM live_orders WHERE coin=? ORDER BY id DESC LIMIT 1",
-            (coin,)
+            "SELECT direction, contracts, status, error, created_at FROM live_orders WHERE coin=? AND window_ts>=? ORDER BY id DESC LIMIT 1",
+            (coin, recent_cutoff)
         ).fetchone()
         coin_last_order[coin] = row
     conn.close()
