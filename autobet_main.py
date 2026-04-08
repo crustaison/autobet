@@ -2153,6 +2153,15 @@ def build_dashboard(user=None):
     # Live toggle state
     state = conn.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
     live_on = state and state[0] == 1
+    # Per-coin live mode and last live order
+    coin_modes_db = {r[0]: r[1] for r in conn.execute("SELECT coin, mode FROM coin_modes").fetchall()}
+    coin_last_order = {}
+    for coin in COINS:
+        row = conn.execute(
+            "SELECT direction, contracts, status, error, created_at FROM live_orders WHERE coin=? ORDER BY id DESC LIMIT 1",
+            (coin,)
+        ).fetchone()
+        coin_last_order[coin] = row
     conn.close()
 
     with _state_lock:
@@ -2211,6 +2220,29 @@ def build_dashboard(user=None):
             ev_html = f'<div style="margin:5px 0 2px 0"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:10px;color:#8b949e">Edge</span><div style="flex:1;height:4px;background:#21262d;border-radius:2px"><div style="width:{ev_bar_w:.0f}%;height:100%;background:{ev_bar_col};border-radius:2px"></div></div><span style="font-size:10px;font-weight:700" class="{ev_cls}">EV {ev_val:+.3f}</span>{tooltip_html("edge")}</div></div>'
         else:
             ev_html = '<div style="margin:5px 0 2px 0;font-size:10px;color:#555">Edge — no data yet</div>'
+        # Live fill indicator
+        coin_is_live = live_on and coin_modes_db.get(coin) == "live"
+        last_order = coin_last_order.get(coin)
+        if coin_is_live:
+            if last_order:
+                lo_dir, lo_contracts, lo_status, lo_error, lo_time = last_order
+                lo_color = {"placed": "#e3b341", "filled": "#3fb950", "failed": "#f85149", "canceled": "#8b949e"}.get(lo_status, "#8b949e")
+                lo_icon  = {"placed": "⏳", "filled": "✓", "failed": "✗", "canceled": "–"}.get(lo_status, "?")
+                lo_label = f'{lo_icon} {lo_status}'
+                if lo_status == "failed" and lo_error:
+                    short_err = lo_error.replace("HTTP 401: ", "").replace('{"error":{"code":"authentication_error","message":"authentication_error","details":"', "").rstrip('"}')[:30]
+                    lo_label += f' — {short_err}'
+                live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid {lo_color};display:flex;align-items:center;gap:6px" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
+                                 f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
+                                 f'<span style="font-size:11px;color:{lo_color};font-weight:600">{lo_label}</span>' \
+                                 f'<span style="font-size:10px;color:#555;margin-left:auto">{lo_contracts}c</span></div>'
+            else:
+                live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid #30363d;display:flex;align-items:center;gap:6px">' \
+                                 f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
+                                 f'<span style="font-size:11px;color:#555">no orders yet</span></div>'
+        else:
+            live_indicator = ""
+
         body += f"""<div class="card" style="cursor:pointer;transition:border-color 0.15s" onclick="window.location='/coin/{coin}'" onmouseover="this.style.borderColor='{color}'" onmouseout="this.style.borderColor=''">
   <div class="card-header">
     <div class="coin-badge" style="background:{color}">{letter}</div>
@@ -2223,6 +2255,7 @@ def build_dashboard(user=None):
   <div class="stat-row"><span class="stat-label">P&amp;L / Rate</span><span class="stat-value"><span class="{pnl_cls}">${total_pnl:+.2f}</span> &nbsp; {win_rate}</span></div>
   <div class="stat-row" style="font-size:10px"><span class="stat-label" style="color:#555">ex-outlier P&amp;L {tooltip_html("ex_outlier")}</span><span class="stat-value" style="font-size:10px"><span class="{'green' if (coin_ex_outlier.get(coin,(0,0,0))[1])>=0 else 'red'}">${coin_ex_outlier.get(coin,(0,0,0))[1]:+.2f}</span></span></div>
   <div style="margin-top:8px" onclick="event.stopPropagation()">{open_badge}</div>
+  {live_indicator}
 </div>
 """
     body += '</div>\n<div class="section-title">Recent Trades</div>\n'
@@ -2857,74 +2890,86 @@ def build_replay_page(user=None, msg="", run_id=None):
 
 # ── Import Wizard page ────────────────────────────────────────────────────────────
 def build_fill_quality_page(user=None):
+    import datetime as _dt
     conn = db_connect()
-    body = '<div class="page-header">Fill Quality</div>\n'
-    body += '<div class="page-sub">Order book liquidity checks — shows whether trades had enough available contracts.</div>\n'
 
-    rows = conn.execute(
-        "SELECT coin, window_ts, ticker, direction, entry, requested_contracts, available_contracts, filled_contracts, liquidity_ok, created_at "
-        "FROM fill_quality ORDER BY id DESC LIMIT 100"
+    liq_rows = conn.execute(
+        "SELECT coin, window_ts, direction, entry, requested_contracts, available_contracts, filled_contracts, liquidity_ok, created_at "
+        "FROM fill_quality ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+    live_rows = conn.execute(
+        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, filled_contracts, avg_fill_price, created_at "
+        "FROM live_orders ORDER BY id DESC LIMIT 30"
     ).fetchall()
     conn.close()
 
-    if not rows:
-        body += '<div class="card"><p class="muted">No fill quality records yet — records appear once the decision loop runs with order book checks enabled.</p></div>\n'
+    body = '<div class="page-header">Fill Quality</div>\n'
+    body += '<div class="page-sub">Liquidity checks and live Kalshi order history.</div>\n'
+
+    # ── Live Orders ──────────────────────────────────────────────────────────────
+    body += '<div class="section-title" style="margin-top:4px">Live Orders</div>\n'
+    if not live_rows:
+        body += '<div class="card"><p class="muted" style="margin:0">No live orders yet — enable global live toggle and set a coin to live mode.</p></div>\n'
     else:
-        body += '<div class="card">\n'
-        body += '<table class="data-table">\n'
-        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Requested</th><th>Available</th><th>Filled</th><th>Status</th></tr>\n'
-        import datetime as _dt
-        for r in rows:
-            coin, wts, ticker, direction, entry, req, avail, filled, liq_ok, created_at = r
+        body += '<div class="card" style="padding:0;overflow:hidden">\n'
+        for r in live_rows:
+            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, filled, avg_price, created_at = r
             try:
                 ts = _dt.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
             except:
                 ts = str(wts)
-            req_s = f"{req:.1f}" if req is not None else "—"
-            avail_s = f"{avail:.1f}" if avail is not None else "—"
-            filled_s = f"{filled:.1f}" if filled is not None else "—"
-            if liq_ok == 1:
-                status = '<span style="color:#3fb950">✓ OK</span>'
-            elif liq_ok == 0 and avail is not None and avail < 10:
-                status = '<span style="color:#f85149">✗ SKIP (thin)</span>'
-            else:
-                status = '<span style="color:#e3b341">~ PARTIAL</span>'
-            dir_color = "#3fb950" if direction == "YES" else "#f85149"
-            body += f'<tr><td>{ts}</td><td>{coin}</td><td style="color:{dir_color}">{direction}</td>'
-            body += f'<td>{entry:.4f}</td><td>{req_s}</td><td>{avail_s}</td><td>{filled_s}</td><td>{status}</td></tr>\n'
-        body += '</table>\n</div>\n'
+            dir_color  = "#3fb950" if direction == "YES" else "#f85149"
+            sc = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e"}.get(status, "#8b949e")
+            icon = {"filled": "✓", "placed": "⏳", "failed": "✗", "canceled": "–"}.get(status, "?")
+            oid_short  = (order_id or "")[:12] + "…" if order_id else "—"
+            filled_s   = f"{filled}c" if filled is not None else "—"
+            avg_s      = f"{avg_price*100:.0f}¢" if avg_price else f"{limit_price}¢ limit"
+            err_s      = ""
+            if status == "failed" and error:
+                # strip boilerplate, show just the meaningful part
+                clean = error.replace('HTTP 401: {"error":{"code":"authentication_error","message":"authentication_error","details":"', "").rstrip('"} ')
+                clean = clean.replace('HTTP 404: {"error":{"code":"market_not_found","message":"market not found","service":"exchange"}', "market not found")
+                err_s = f'<div style="font-size:10px;color:#f85149;margin-top:2px">{clean[:80]}</div>'
+            body += f'''<div style="padding:10px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:12px">
+  <div style="width:72px;font-size:11px;color:#8b949e">{ts}</div>
+  <div style="width:32px;font-size:12px;font-weight:700;color:{COIN_COLORS.get(coin,"#ccc")}">{coin}</div>
+  <div style="width:28px;font-size:11px;font-weight:600;color:{dir_color}">{direction}</div>
+  <div style="width:36px;font-size:11px;color:#ccc">{contracts}c</div>
+  <div style="width:40px;font-size:11px;color:#8b949e">{avg_s}</div>
+  <div style="flex:1;font-size:10px;color:#555;font-family:monospace">{oid_short}</div>
+  <div style="width:60px;text-align:right"><span style="font-size:11px;font-weight:600;color:{sc}">{icon} {status}</span>{err_s}</div>
+</div>'''
+        body += '</div>\n'
 
-    # Live orders section
-    body += '<div class="page-header" style="margin-top:24px">Live Orders</div>\n'
-    body += '<div class="page-sub">Real Kalshi orders placed when live mode is enabled.</div>\n'
-    conn2 = db_connect()
-    live_rows = conn2.execute(
-        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, filled_contracts, avg_fill_price, created_at "
-        "FROM live_orders ORDER BY id DESC LIMIT 50"
-    ).fetchall()
-    conn2.close()
-    if not live_rows:
-        body += '<div class="card"><p class="muted">No live orders yet. Enable global live toggle + set a coin to live mode to start placing real orders.</p></div>\n'
+    # ── Liquidity Checks ─────────────────────────────────────────────────────────
+    body += '<div class="section-title" style="margin-top:20px">Liquidity Checks</div>\n'
+    if not liq_rows:
+        body += '<div class="card"><p class="muted" style="margin:0">No liquidity check records yet.</p></div>\n'
     else:
-        body += '<div class="card" style="overflow-x:auto">\n<table class="data-table">\n'
-        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Req</th><th>Filled</th><th>Avg¢</th><th>Order ID</th><th>Status</th><th>Error</th></tr>\n'
-        import datetime as _dt2
-        for r in live_rows:
-            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, filled, avg_price, created_at = r
+        body += '<div class="card" style="padding:0;overflow:hidden">\n'
+        for r in liq_rows:
+            coin, wts, direction, entry, req, avail, filled, liq_ok, created_at = r
             try:
-                ts = _dt2.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
+                ts = _dt.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
             except:
                 ts = str(wts)
             dir_color = "#3fb950" if direction == "YES" else "#f85149"
-            status_color = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e"}.get(status, "#8b949e")
-            oid = f'<span style="font-family:monospace;font-size:10px">{(order_id or "")[:14]}…</span>' if order_id else "—"
-            filled_s = str(filled) if filled is not None else "—"
-            avg_s = f"{avg_price*100:.0f}¢" if avg_price else "—"
-            body += f'<tr><td>{ts}</td><td>{coin}</td><td style="color:{dir_color}">{direction}</td>'
-            body += f'<td>{contracts}</td><td>{filled_s}</td><td>{avg_s}</td>'
-            body += f'<td>{oid}</td><td style="color:{status_color}">{status}</td>'
-            body += f'<td style="font-size:11px;color:#f85149">{(error or "")[:60]}</td></tr>\n'
-        body += '</table>\n</div>\n'
+            if liq_ok == 1:
+                st_icon, st_color, st_label = "✓", "#3fb950", "OK"
+            elif avail is not None and avail < 10:
+                st_icon, st_color, st_label = "✗", "#f85149", "thin"
+            else:
+                st_icon, st_color, st_label = "~", "#e3b341", "partial"
+            avail_s = f"{avail:,.0f}" if avail is not None else "—"
+            body += f'''<div style="padding:8px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:12px">
+  <div style="width:72px;font-size:11px;color:#8b949e">{ts}</div>
+  <div style="width:32px;font-size:12px;font-weight:700;color:{COIN_COLORS.get(coin,"#ccc")}">{coin}</div>
+  <div style="width:28px;font-size:11px;font-weight:600;color:{dir_color}">{direction}</div>
+  <div style="width:44px;font-size:11px;color:#ccc">{entry:.3f}</div>
+  <div style="flex:1;font-size:11px;color:#555">{avail_s} avail</div>
+  <div style="width:52px;text-align:right;font-size:11px;font-weight:600;color:{st_color}">{st_icon} {st_label}</div>
+</div>'''
+        body += '</div>\n'
 
     return page_shell("Fill Quality", "/fill-quality", body, user=user)
 
