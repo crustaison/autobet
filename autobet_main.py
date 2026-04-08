@@ -58,7 +58,7 @@ BASE_DIR   = Path.home() / "autoresearch"
 DATA_DIR   = BASE_DIR / "data"
 DB_PATH    = Path.home() / "autobet" / "data" / "autobet.db"
 ENV_FILE   = BASE_DIR / ".env"
-KALSHI_PEM = BASE_DIR / "kalshi.pem"
+KALSHI_PEM = Path.home() / "autobet" / "kalshi.key"
 LOGO_PATH  = Path.home() / "autobet" / "logo.jpg"
 
 PORT = 7778
@@ -96,7 +96,7 @@ def load_env():
 ENV = load_env()
 MINIMAX_KEY   = ENV.get("MINIMAX_API_KEY", "")
 _MINIMAX_MODEL_DEFAULT = ENV.get("MINIMAX_MODEL", "MiniMax-M2.5")
-KALSHI_KEY_ID = ENV.get("KALSHI_KEY_ID", "bd9c9f63-1f13-4527-8bc6-3c3a05196b49")
+KALSHI_KEY_ID = ENV.get("KALSHI_KEY_ID", "a7614a86-cb1e-4bd3-8c54-835046d28c21")
 
 def get_minimax_model():
     """Read the active model from the settings table (falls back to .env default)."""
@@ -213,6 +213,50 @@ def place_kalshi_order(ticker, direction, contracts, entry):
         return None, err
     order_id = (resp or {}).get("order", {}).get("order_id")
     return order_id, None
+
+def sync_live_orders():
+    """
+    Poll Kalshi for status of placed orders and sync actual fill/P&L into live_orders.
+    Runs in background every 60s. Updates status to 'filled'/'canceled' and records actual fill price.
+    """
+    try:
+        conn = db_connect()
+        pending = conn.execute(
+            "SELECT id, coin, window_ts, ticker, direction, contracts, order_id "
+            "FROM live_orders WHERE status='placed' AND order_id IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        for row in pending:
+            lo_id, coin, wts, ticker, direction, contracts, order_id = row
+            resp = kalshi_get(f"/portfolio/orders/{order_id}")
+            if not resp:
+                continue
+            order = resp.get("order", {})
+            status = order.get("status", "")
+            filled_count = order.get("contracts_filled", 0) or 0
+            avg_price_cents = order.get("avg_fill_price", 0) or 0
+            avg_price = avg_price_cents / 100.0 if avg_price_cents else 0.0
+            new_status = {"filled": "filled", "canceled": "canceled", "resting": "placed"}.get(status, status)
+            conn2 = db_connect()
+            conn2.execute(
+                "UPDATE live_orders SET status=?, filled_contracts=?, avg_fill_price=? WHERE id=?",
+                (new_status, filled_count, avg_price, lo_id)
+            )
+            conn2.commit()
+            conn2.close()
+            if new_status == "filled" and filled_count > 0 and avg_price > 0:
+                print(f"[LIVE] {coin} order {order_id[:12]} filled: {filled_count} contracts @ {avg_price:.3f}")
+    except Exception as e:
+        print(f"[LIVE SYNC] {e}")
+
+def live_order_sync_loop():
+    time.sleep(30)
+    while True:
+        try:
+            sync_live_orders()
+        except Exception as e:
+            print(f"[LIVE SYNC LOOP] {e}")
+        time.sleep(60)
 
 # ── Kalshi order book liquidity ─────────────────────────────────────────────────
 _ob_cache = {}   # ticker -> (fetched_ts, orderbook_fp dict)
@@ -468,6 +512,8 @@ def db_init():
             order_id TEXT,
             status TEXT DEFAULT 'placed',
             error TEXT,
+            filled_contracts INTEGER,
+            avg_fill_price REAL,
             created_at TEXT
         );
     """)
@@ -2778,7 +2824,7 @@ def build_fill_quality_page(user=None):
     body += '<div class="page-sub">Real Kalshi orders placed when live mode is enabled.</div>\n'
     conn2 = db_connect()
     live_rows = conn2.execute(
-        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, created_at "
+        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, filled_contracts, avg_fill_price, created_at "
         "FROM live_orders ORDER BY id DESC LIMIT 50"
     ).fetchall()
     conn2.close()
@@ -2786,19 +2832,21 @@ def build_fill_quality_page(user=None):
         body += '<div class="card"><p class="muted">No live orders yet. Enable global live toggle + set a coin to live mode to start placing real orders.</p></div>\n'
     else:
         body += '<div class="card" style="overflow-x:auto">\n<table class="data-table">\n'
-        body += '<tr><th>Time</th><th>Coin</th><th>Ticker</th><th>Dir</th><th>Contracts</th><th>Limit¢</th><th>Order ID</th><th>Status</th><th>Error</th></tr>\n'
+        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Req</th><th>Filled</th><th>Avg¢</th><th>Order ID</th><th>Status</th><th>Error</th></tr>\n'
         import datetime as _dt2
         for r in live_rows:
-            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, created_at = r
+            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, filled, avg_price, created_at = r
             try:
                 ts = _dt2.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
             except:
                 ts = str(wts)
             dir_color = "#3fb950" if direction == "YES" else "#f85149"
-            status_color = "#3fb950" if status == "placed" else "#f85149"
-            oid = f'<span style="font-family:monospace;font-size:10px">{(order_id or "")[:16]}…</span>' if order_id else "—"
-            body += f'<tr><td>{ts}</td><td>{coin}</td><td style="font-family:monospace;font-size:11px">{ticker or "—"}</td>'
-            body += f'<td style="color:{dir_color}">{direction}</td><td>{contracts}</td><td>{limit_price}¢</td>'
+            status_color = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e"}.get(status, "#8b949e")
+            oid = f'<span style="font-family:monospace;font-size:10px">{(order_id or "")[:14]}…</span>' if order_id else "—"
+            filled_s = str(filled) if filled is not None else "—"
+            avg_s = f"{avg_price*100:.0f}¢" if avg_price else "—"
+            body += f'<tr><td>{ts}</td><td>{coin}</td><td style="color:{dir_color}">{direction}</td>'
+            body += f'<td>{contracts}</td><td>{filled_s}</td><td>{avg_s}</td>'
             body += f'<td>{oid}</td><td style="color:{status_color}">{status}</td>'
             body += f'<td style="font-size:11px;color:#f85149">{(error or "")[:60]}</td></tr>\n'
         body += '</table>\n</div>\n'
@@ -3939,10 +3987,11 @@ def main():
 
     # Start background threads
     threads = [
-        threading.Thread(target=collect_prices,     daemon=True, name="prices"),
-        threading.Thread(target=collect_kalshi,     daemon=True, name="kalshi"),
-        threading.Thread(target=collect_polymarket, daemon=True, name="polymarket"),
-        threading.Thread(target=decision_loop,      daemon=True, name="decisions"),
+        threading.Thread(target=collect_prices,        daemon=True, name="prices"),
+        threading.Thread(target=collect_kalshi,        daemon=True, name="kalshi"),
+        threading.Thread(target=collect_polymarket,    daemon=True, name="polymarket"),
+        threading.Thread(target=decision_loop,         daemon=True, name="decisions"),
+        threading.Thread(target=live_order_sync_loop,  daemon=True, name="live_sync"),
     ]
     for t in threads:
         t.start()
