@@ -1155,7 +1155,7 @@ Your task: Synthesize all available signals and make the final trading decision.
 - If LOWER: direction=NO, entry=(1 - yes_bid) value from the order book above
 - Strong consensus from multiple engines = high confidence. Mixed signals = lower confidence or PASS.
 - Wide spreads and low volume increase risk — reduce confidence accordingly.
-- Before finalizing: state the strongest argument AGAINST your chosen direction. If that counter-argument is compelling (e.g. order book strongly disagrees with your direction, or multiple engines conflict), revise your answer or reduce confidence to below 0.55. Do not talk yourself into a trade — if genuinely uncertain, PASS is correct.
+- Before finalizing: consider the strongest argument AGAINST your chosen direction. If that counter-argument is compelling, reduce your confidence below 0.50 — the system will automatically skip low-confidence trades. Always output YES or NO as the direction (never any other value); use confidence to express uncertainty.
 - Only suggest an engine switch if you have strong conviction that a different engine would perform significantly better for THIS coin's current market regime (e.g. strong sustained trend → rules_engine, rich resolved history → vector_knn). Default to null — do NOT suggest a switch just because signals are mixed or uncertain. A suggestion triggers an auto-switch after several consecutive windows, so only suggest when you are confident it will improve results long-term.
 
 Respond with JSON only:
@@ -1219,6 +1219,13 @@ Respond with JSON only:
 
     mm = results.get("minimax")
     lo = results.get("local")
+
+    # Treat PASS direction as no-signal (model expressing uncertainty via direction field)
+    if mm and mm.get("direction") not in ("YES", "NO"):
+        print(f"[DUAL LLM] {coin}: MiniMax returned direction={mm.get('direction')} — treating as no signal")
+        mm = None
+    if lo and lo.get("direction") not in ("YES", "NO"):
+        lo = None
 
     if mm and lo:
         mm_dir, lo_dir = mm.get("direction"), lo.get("direction")
