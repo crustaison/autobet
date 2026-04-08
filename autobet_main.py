@@ -3509,7 +3509,7 @@ def build_fill_quality_page(user=None):
     import time as _time
     recent_2h = int(_time.time()) - 7200
     live_rows = conn.execute(
-        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, filled_contracts, avg_fill_price, created_at "
+        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, filled_contracts, avg_fill_price, created_at, pnl, actual_direction "
         "FROM live_orders WHERE status != 'failed' OR window_ts >= ? ORDER BY id DESC LIMIT 30",
         (recent_2h,)
     ).fetchall()
@@ -3524,8 +3524,19 @@ def build_fill_quality_page(user=None):
         body += '<div class="card"><p class="muted" style="margin:0">No live orders yet — enable global live toggle and set a coin to live mode.</p></div>\n'
     else:
         body += '<div class="card" style="padding:0;overflow:hidden">\n'
+        body += '''<div style="padding:6px 16px;border-bottom:1px solid #30363d;display:flex;align-items:center;gap:24px;background:#161b22">
+  <div style="width:80px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Time</div>
+  <div style="width:40px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Coin</div>
+  <div style="width:36px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Dir</div>
+  <div style="width:48px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Contracts</div>
+  <div style="width:56px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Price</div>
+  <div style="width:40px;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Filled</div>
+  <div style="flex:1;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Order ID</div>
+  <div style="width:60px;text-align:right;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">P&L</div>
+  <div style="width:80px;text-align:right;font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.05em">Status</div>
+</div>\n'''
         for r in live_rows:
-            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, filled, avg_price, created_at = r
+            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, filled, avg_price, created_at, pnl, actual_dir = r
             try:
                 ts = _dt.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
             except:
@@ -3549,6 +3560,7 @@ def build_fill_quality_page(user=None):
   <div style="width:56px;font-size:11px;color:#8b949e">{avg_s}</div>
   <div style="width:40px;font-size:11px;color:#8b949e">{filled_s}</div>
   <div style="flex:1;font-size:10px;color:#555;font-family:monospace">{oid_short}</div>
+  <div style="width:60px;text-align:right;font-size:11px;font-weight:600;color:{"#3fb950" if pnl and pnl>0 else "#f85149" if pnl and pnl<0 else "#8b949e"}">{f"+${pnl:.2f}" if pnl and pnl>0 else f"-${abs(pnl):.2f}" if pnl and pnl<0 else "—"}</div>
   <div style="width:80px;text-align:right"><span style="font-size:11px;font-weight:600;color:{sc}">{icon} {status}</span>{err_s}</div>
 </div>'''
         body += '</div>\n'
