@@ -188,20 +188,28 @@ def kalshi_post(path, body_dict):
         print(f"[KALSHI] POST {path}: {e}")
         return None, str(e)
 
-def place_kalshi_order(ticker, direction, contracts, entry):
+def place_kalshi_order(coin, ticker, direction, contracts, entry):
     """
-    Place a market/limit order on Kalshi.
-    direction: "YES" or "NO"
-    contracts: integer number of contracts
-    entry: limit price (0.01–0.99), used as limit to avoid slippage
-    Returns (order_id, error_str)
+    Place a limit order on Kalshi.
+    Fetches a fresh ticker from the API to avoid using stale cached tickers.
+    Returns (order_id, actual_ticker_used, error_str)
     """
+    # Always get the freshest open ticker — never trust cached value
+    series = SERIES.get(coin, f"KX{coin}15M")
+    fresh = kalshi_get("/markets", {"series_ticker": series, "status": "open", "limit": 1})
+    fresh_mkts = (fresh or {}).get("markets", [])
+    if fresh_mkts:
+        live_ticker = fresh_mkts[0]["ticker"]
+    else:
+        live_ticker = ticker  # fallback to cached
+    if not live_ticker:
+        return None, ticker, "No open market found"
+
     side = "yes" if direction == "YES" else "no"
-    # Kalshi prices are in cents (integer 1-99)
     limit_price = max(1, min(99, round(entry * 100)))
     body = {
-        "ticker": ticker,
-        "client_order_id": f"autobet_{ticker}_{int(time.time())}",
+        "ticker": live_ticker,
+        "client_order_id": f"autobet_{live_ticker}_{int(time.time())}",
         "type": "limit",
         "action": "buy",
         "side": side,
@@ -210,9 +218,9 @@ def place_kalshi_order(ticker, direction, contracts, entry):
     }
     resp, err = kalshi_post("/portfolio/orders", body)
     if err:
-        return None, err
+        return None, live_ticker, err
     order_id = (resp or {}).get("order", {}).get("order_id")
-    return order_id, None
+    return order_id, live_ticker, None
 
 def sync_live_orders():
     """
@@ -1261,13 +1269,13 @@ def decision_loop():
                         is_live = (global_live and global_live[0]) and (coin_mode_row and coin_mode_row[0] == "live")
                         if is_live and ticker:
                             live_contracts = max(1, int(contracts))
-                            order_id, order_err = place_kalshi_order(ticker, direction, live_contracts, entry)
+                            order_id, used_ticker, order_err = place_kalshi_order(coin, ticker, direction, live_contracts, entry)
                             conn3 = db_connect()
                             conn3.execute("""
                                 INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
                                     limit_price, order_id, status, error, created_at)
                                 VALUES (?,?,?,?,?,?,?,?,?,?)
-                            """, (coin, wts, ticker, direction, live_contracts,
+                            """, (coin, wts, used_ticker, direction, live_contracts,
                                   max(1, min(99, round(entry*100))),
                                   order_id, "placed" if order_id else "failed",
                                   order_err, now_cst().isoformat()))
