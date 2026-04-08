@@ -338,6 +338,7 @@ def live_order_sync_loop():
 _ob_cache = {}   # ticker -> (fetched_ts, orderbook_fp dict)
 _ob_lock  = threading.Lock()
 _pool_last_placed_wts = 0   # prevents duplicate pool orders in the same window
+_local_llm_sem = threading.Semaphore(1)  # only one 35B subprocess at a time
 
 def fetch_orderbook(ticker):
     """Return orderbook_fp dict for ticker, cached 45s. Returns None on error."""
@@ -1252,26 +1253,28 @@ Respond with JSON only:
 
 def local_llm_analyze(coin, prompt):
     """
-    Fallback to local Qwen3.5-35B-A3B via nexa infer subprocess.
-    Uses /no_think prefix to skip chain-of-thought and return JSON in ~25-35s.
+    Local Qwen3.5-35B-A3B via nexa infer subprocess.
+    Serialized via semaphore — only one instance runs at a time since the
+    35B subprocess loads 20GB each call and cannot handle parallel invocations.
     """
+    if not _local_llm_sem.acquire(blocking=True, timeout=5):
+        # Another coin already has the model loaded — skip rather than queue
+        print(f"[LOCAL LLM] {coin}: skipped (another call in progress)")
+        return None
     try:
         import subprocess as _sp, re as _re
         nexa_cli = "/opt/nexa_sdk/nexa-cli"
         model    = "unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M"
-        # Prepend /no_think to suppress chain-of-thought
         local_prompt = "/no_think\n\n" + prompt
         t0 = time.time()
         result = _sp.run(
             [nexa_cli, "infer", model,
              "--max-tokens", "300", "--hide-think",
              "-p", local_prompt],
-            capture_output=True, text=True, timeout=90
+            capture_output=True, text=True, timeout=75
         )
         elapsed = time.time() - t0
-        # Strip ANSI escape codes and spinner lines
         raw = _re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]|\r', '', result.stdout + result.stderr)
-        # Extract first valid JSON object
         for m in _re.finditer(r'\{[^{}]+\}', raw, _re.DOTALL):
             try:
                 parsed = json.loads(m.group())
@@ -1280,9 +1283,11 @@ def local_llm_analyze(coin, prompt):
                     return parsed
             except Exception:
                 pass
-        print(f"[LOCAL LLM] {coin}: no valid JSON in output ({elapsed:.1f}s)")
+        print(f"[LOCAL LLM] {coin}: no valid JSON ({elapsed:.1f}s)")
     except Exception as le:
         print(f"[LOCAL LLM] {coin}: {le}")
+    finally:
+        _local_llm_sem.release()
     return None
 
 def format_ticks_summary(ticks):
@@ -1504,7 +1509,7 @@ def decision_loop():
                         return
 
                     direction  = result.get("direction", "")
-                    entry      = float(result.get("entry", 0))
+                    entry      = float(result.get("entry") or 0)
                     confidence = float(result.get("confidence", 0.5))
                     rationale  = result.get("rationale", "")
                     # ── Engine suggestion / auto-switch ─────────────────────────
