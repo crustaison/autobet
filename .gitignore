@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .env
 *.pem
+*.key
+kalshi_key_id.txt
+*_backup_*.py
+trade.md
+Clydesbro*
