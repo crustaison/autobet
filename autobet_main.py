@@ -173,9 +173,11 @@ def kalshi_get(path, params=None):
 
 def kalshi_post(path, body_dict):
     url = KALSHI_BASE + path
-    hdrs = kalshi_auth_headers("POST", "/trade-api/v2" + path)
+    auth_path = "/trade-api/v2" + path
+    hdrs = kalshi_auth_headers("POST", auth_path)
     hdrs["Content-Type"] = "application/json"
     data = json.dumps(body_dict).encode()
+    print(f"[KALSHI POST] key={KALSHI_KEY_ID[:8]} path={auth_path} body={data.decode()[:120]}")
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
@@ -257,11 +259,54 @@ def sync_live_orders():
     except Exception as e:
         print(f"[LIVE SYNC] {e}")
 
+def sync_kalshi_balance():
+    """
+    For any coin in live mode, pull the real Kalshi portfolio balance
+    and overwrite the paper_accounts capital with the actual value.
+    Kalshi has one balance shared across all coins — we split it proportionally
+    by starting capital, then reconcile each live coin's account.
+    Since we only have one Kalshi account, we just set each live coin's
+    paper balance to: starting_capital + (kalshi_total - sum_of_all_starting_capitals).
+    Simpler: track the delta per coin from live orders and apply to paper account.
+    Actually simplest: just set the live coin's paper balance = Kalshi balance,
+    since there's only one live coin at a time.
+    """
+    try:
+        resp = kalshi_get("/portfolio/balance")
+        if not resp:
+            return
+        kalshi_bal = resp.get("balance", 0) / 100.0  # cents -> dollars
+        conn = db_connect()
+        # Find all live-mode coins
+        live_coins = [r[0] for r in conn.execute(
+            "SELECT coin FROM coin_modes WHERE mode='live'"
+        ).fetchall()]
+        global_live = conn.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
+        if not (global_live and global_live[0]) or not live_coins:
+            conn.close()
+            return
+        # If exactly one live coin, its paper balance = Kalshi balance
+        if len(live_coins) == 1:
+            coin = live_coins[0]
+            old = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
+            old_bal = old[0] if old else 0
+            if abs(old_bal - kalshi_bal) > 0.01:
+                conn.execute("UPDATE paper_accounts SET capital=?, updated_at=? WHERE coin=?",
+                             (kalshi_bal, now_cst().isoformat(), coin))
+                conn.execute("UPDATE paper_runs SET current_capital=? WHERE coin=? AND status='active'",
+                             (kalshi_bal, coin))
+                conn.commit()
+                print(f"[BALANCE SYNC] {coin} paper balance {old_bal:.2f} -> {kalshi_bal:.2f} (Kalshi)")
+        conn.close()
+    except Exception as e:
+        print(f"[BALANCE SYNC] {e}")
+
 def live_order_sync_loop():
     time.sleep(30)
     while True:
         try:
             sync_live_orders()
+            sync_kalshi_balance()
         except Exception as e:
             print(f"[LIVE SYNC LOOP] {e}")
         time.sleep(60)
