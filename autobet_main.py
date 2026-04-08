@@ -1110,7 +1110,7 @@ Respond with JSON only, no explanation:
         headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=120) as r:
             resp = json.loads(r.read().decode())
             text = ""
             for block in resp.get("content", []):
@@ -1274,6 +1274,7 @@ def resolve_live_orders():
 
 
 def decision_loop():
+    global _pool_last_placed_wts
     time.sleep(10)
     last_decided_wts = 0
     while True:
@@ -1282,12 +1283,18 @@ def decision_loop():
             now = int(time.time())
             secs_into = now - wts
             if secs_into > 180:
+                # Still run resolution even when outside decision window
+                try:
+                    resolve_trades()
+                    resolve_live_orders()
+                except Exception:
+                    pass
                 time.sleep(30)
                 continue
             if wts <= last_decided_wts:
                 time.sleep(30)
                 continue
-            def _decide_coin(coin, wts, now, pool_signals=None, pool_lock=None):
+            def _decide_coin(coin, wts, now, pool_signals=None, pool_lock=None, stale_counter=None, api_delay=0):
               try:
                 conn = db_connect()
                 try:
@@ -1300,9 +1307,17 @@ def decision_loop():
                         mkt = _active_mkts.get(coin)
                         coin_price = _prices.get(coin)
                     if not mkt or mkt.get("window_ts") != wts:
+                        mkt_wts = mkt.get("window_ts") if mkt else None
+                        print(f"[SKIP] {coin} wts={wts}: stale market data (mkt_wts={mkt_wts})")
+                        if stale_counter is not None:
+                            stale_counter.append(1)
                         return
                     if not coin_price:
+                        print(f"[SKIP] {coin} wts={wts}: no coin price")
                         return
+                    # Stagger MiniMax API calls only — market data already checked above
+                    if api_delay:
+                        time.sleep(api_delay)
                     prev_wts = wts - 900
                     ticks = get_recent_ticks(conn, coin, prev_wts, n=10)
                     ticks_summary = format_ticks_summary(ticks)
@@ -1355,6 +1370,7 @@ def decision_loop():
                     confidence = float(result.get("confidence", 0.5))
                     rationale  = result.get("rationale", "")
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
+                        print(f"[SKIP] {coin} wts={wts}: bad engine result dir={direction} entry={entry}")
                         return
 
                     # ── Signal quality filters (data-driven) ────────────────────
@@ -1366,7 +1382,7 @@ def decision_loop():
                     except Exception:
                         min_conf = 0.55
                     is_betbot = bool(result.get("_betbot_size"))
-                    if not is_betbot and confidence <= min_conf:
+                    if not is_betbot and confidence < min_conf:
                         conn.execute("""
                             INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                             VALUES (?,?,?,?,?,?,?)
@@ -1519,16 +1535,31 @@ def decision_loop():
               except Exception as e:
                 print(f"[DECISION] {coin} outer: {e}")
 
-            # Pool mode: collect live signals, pick best one after all threads done
-            _pool_signals = {}  # coin -> {direction, entry, confidence, contracts, ticker}
-            _pool_lock = threading.Lock()
+            # Retry loop: if all coins have stale data, wait for Kalshi collector to catch up
+            _retry_deadline = wts + 175  # give up 5s before the 180s cutoff
+            while True:
+                _stale_counter = []
+                # Pool mode: collect live signals, pick best one after all threads done
+                _pool_signals = {}  # coin -> {direction, entry, confidence, contracts, ticker}
+                _pool_lock = threading.Lock()
 
-            def _decide_coin_pooled(coin, wts, now):
-                _decide_coin(coin, wts, now, pool_signals=_pool_signals, pool_lock=_pool_lock)
+                def _decide_coin_pooled(coin, wts, now, api_delay=0):
+                    _decide_coin(coin, wts, now, pool_signals=_pool_signals, pool_lock=_pool_lock,
+                                 stale_counter=_stale_counter, api_delay=api_delay)
 
-            threads = [threading.Thread(target=_decide_coin_pooled, args=(coin, wts, now), daemon=True) for coin in COINS]
-            for t in threads: t.start()
-            for t in threads: t.join(timeout=150)
+                # All coins check market data immediately; stagger only the MiniMax API call
+                threads = [threading.Thread(target=_decide_coin_pooled,
+                           args=(coin, wts, now, i * 10), daemon=True)
+                           for i, coin in enumerate(COINS)]
+                for t in threads: t.start()
+                for t in threads: t.join(timeout=180)
+
+                # If any coin was stale and we still have time, wait and retry
+                if len(_stale_counter) > 0 and int(time.time()) < _retry_deadline:
+                    print(f"[DECISION] {len(_stale_counter)} coins stale for wts={wts}, waiting 15s for Kalshi collector...")
+                    time.sleep(15)
+                    continue
+                break  # all coins got fresh data, or window closing
 
             # ── Pool mode: pick best live signal and place one order ──────────
             try:
@@ -2032,35 +2063,38 @@ SHARED_CSS = """
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
   a { color: inherit; text-decoration: none; }
-  .topbar { background: #161b22; border-bottom: 1px solid #30363d; padding: 0 20px; display: flex; align-items: center; height: 56px; gap: 0; position: sticky; top: 0; z-index: 100; }
-  .logo-img { height: 44px; width: 44px; border-radius: 8px; object-fit: cover; margin-right: 12px; }
-  .logo-text { font-size: 18px; font-weight: 800; color: #58a6ff; letter-spacing: 2px; margin-right: 20px; white-space: nowrap; }
-  .nav { display: flex; gap: 2px; flex: 1; overflow-x: auto; }
-  .nav a { padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 500; color: #8b949e; transition: background 0.15s, color 0.15s; white-space: nowrap; }
+  .topbar { background: #161b22; border-bottom: 1px solid #30363d; padding: 0 12px; display: flex; align-items: center; height: 52px; gap: 0; position: sticky; top: 0; z-index: 100; }
+  .logo-img { height: 36px; width: 36px; border-radius: 8px; object-fit: cover; margin-right: 10px; flex-shrink: 0; }
+  .logo-text { font-size: 16px; font-weight: 800; color: #58a6ff; letter-spacing: 2px; margin-right: 12px; white-space: nowrap; flex-shrink: 0; }
+  .nav { display: flex; gap: 2px; flex: 1; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav a { padding: 7px 10px; border-radius: 6px; font-size: 12px; font-weight: 500; color: #8b949e; transition: background 0.15s, color 0.15s; white-space: nowrap; }
   .nav a:hover { background: #21262d; color: #e6edf3; }
   .nav a.active { background: #21262d; color: #58a6ff; }
-  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
-  .content { padding: 20px; max-width: 1600px; margin: 0 auto; }
-  .row { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-bottom: 20px; }
+  .topbar-right { display: none; }
+  .content { padding: 12px; max-width: 1600px; margin: 0 auto; }
+  .row { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-bottom: 16px; }
   .row > * { min-width: 0; }
-  @media (max-width: 500px)  { .row { grid-template-columns: repeat(2, 1fr); } }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; position: relative; }
-  .card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-  .coin-badge { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; flex-shrink: 0; }
-  .coin-name { font-size: 18px; font-weight: 700; }
-  .price { font-size: 22px; font-weight: 700; color: #58a6ff; }
-  .stat-row { display: flex; justify-content: space-between; margin: 5px 0; font-size: 13px; align-items: center; }
+  @media (max-width: 400px) { .row { grid-template-columns: 1fr 1fr; gap: 8px; } }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 12px; position: relative; }
+  .card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .coin-badge { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+  .coin-name { font-size: 16px; font-weight: 700; }
+  .price { font-size: 18px; font-weight: 700; color: #58a6ff; }
+  .stat-row { display: flex; justify-content: space-between; margin: 4px 0; font-size: 12px; align-items: center; }
   .stat-label { color: #8b949e; }
   .stat-value { font-weight: 600; }
   .green { color: #3fb950; } .red { color: #f85149; } .yellow { color: #d29922; } .muted { color: #8b949e; }
-  .section-title { font-size: 13px; font-weight: 700; color: #8b949e; margin: 24px 0 10px; text-transform: uppercase; letter-spacing: 1px; }
-  .trade-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .trade-table th { text-align: left; padding: 7px 10px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .trade-table td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
-  .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .data-table th { text-align: left; padding: 10px 24px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
-  .data-table td { padding: 10px 24px; border-bottom: 1px solid #21262d; white-space: nowrap; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .section-title { font-size: 12px; font-weight: 700; color: #8b949e; margin: 20px 0 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .trade-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .trade-table th { text-align: left; padding: 6px 8px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .trade-table td { padding: 5px 8px; border-bottom: 1px solid #21262d; }
+  .data-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .data-table th { text-align: left; padding: 8px 10px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+  .data-table td { padding: 8px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .trade-table, .data-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .badge { display: inline-block; padding: 2px 6px; border-radius: 10px; font-size: 10px; font-weight: 600; }
   .badge-win  { background: #1a2f1a; color: #3fb950; border: 1px solid #238636; }
   .badge-loss { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
   .badge-open { background: #162032; color: #58a6ff; border: 1px solid #1f6feb; }
@@ -2068,34 +2102,34 @@ SHARED_CSS = """
   .badge-ok   { background: #1a2f1a; color: #3fb950; border: 1px solid #238636; }
   .badge-warn { background: #2d2208; color: #d29922; border: 1px solid #9e6a03; }
   .badge-err  { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
-  .mkt-ticker { color: #8b949e; font-size: 11px; font-family: monospace; }
-  .alert { padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; font-size: 14px; }
+  .mkt-ticker { color: #8b949e; font-size: 10px; font-family: monospace; }
+  .alert { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
   .alert-ok  { background: #1a2f1a; color: #3fb950; border: 1px solid #238636; }
   .alert-err { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
-  .window-bar { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; display: flex; gap: 24px; align-items: center; font-size: 13px; flex-wrap: wrap; }
-  .btn { background: #21262d; border: 1px solid #30363d; color: #e6edf3; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+  .window-bar { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; display: flex; gap: 12px; align-items: center; font-size: 12px; flex-wrap: wrap; }
+  .btn { background: #21262d; border: 1px solid #30363d; color: #e6edf3; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; touch-action: manipulation; }
   .btn:hover { background: #2d333b; }
   .btn-primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
   .btn-primary:hover { background: #388bfd; }
   .btn-danger { background: #da3633; border-color: #da3633; color: #fff; }
   .btn-danger:hover { background: #f85149; }
-  .form-row { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
-  .form-label { font-size: 13px; color: #8b949e; min-width: 180px; }
+  .form-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+  .form-label { font-size: 13px; color: #8b949e; min-width: 140px; }
   .form-val { font-size: 13px; font-weight: 600; }
   input[type=text], input[type=number], input[type=password], select, textarea {
     background: #0d1117; border: 1px solid #30363d; color: #e6edf3;
-    padding: 6px 10px; border-radius: 6px; font-size: 13px; outline: none;
+    padding: 8px 10px; border-radius: 6px; font-size: 16px; outline: none;
   }
   input:focus, select:focus, textarea:focus { border-color: #58a6ff; }
   .health-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .dot-ok { background: #3fb950; } .dot-warn { background: #d29922; } .dot-err { background: #f85149; }
-  .page-header { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
-  .page-sub { font-size: 13px; color: #8b949e; margin-bottom: 20px; }
-  .kill-banner { background: #2d1515; border: 1px solid #da3633; color: #f85149; padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; font-size: 13px; }
+  .page-header { font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+  .page-sub { font-size: 12px; color: #8b949e; margin-bottom: 16px; }
+  .kill-banner { background: #2d1515; border: 1px solid #da3633; color: #f85149; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px; font-weight: 600; font-size: 13px; }
   /* Chat popup */
-  #chat-btn { position: fixed; bottom: 24px; right: 24px; width: 52px; height: 52px; border-radius: 50%; background: #1f6feb; border: none; color: #fff; font-size: 22px; cursor: pointer; z-index: 1000; box-shadow: 0 4px 16px rgba(31,111,235,0.4); transition: transform 0.2s; }
+  #chat-btn { position: fixed; bottom: 20px; right: 16px; width: 48px; height: 48px; border-radius: 50%; background: #1f6feb; border: none; color: #fff; font-size: 20px; cursor: pointer; z-index: 1000; box-shadow: 0 4px 16px rgba(31,111,235,0.4); transition: transform 0.2s; touch-action: manipulation; }
   #chat-btn:hover { transform: scale(1.1); }
-  #chat-panel { display: none; position: fixed; bottom: 88px; right: 24px; width: 360px; max-height: 480px; background: #161b22; border: 1px solid #30363d; border-radius: 12px; z-index: 1000; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.6); }
+  #chat-panel { display: none; position: fixed; bottom: 80px; right: 8px; left: 8px; max-height: 70vh; background: #161b22; border: 1px solid #30363d; border-radius: 12px; z-index: 1000; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.6); }
   #chat-panel.open { display: flex; }
   #chat-header { padding: 12px 16px; border-bottom: 1px solid #30363d; font-weight: 700; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
   #chat-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -2103,8 +2137,31 @@ SHARED_CSS = """
   .chat-msg.user { background: #1f3a5f; align-self: flex-end; }
   .chat-msg.assistant { background: #21262d; align-self: flex-start; }
   #chat-input-row { padding: 10px; border-top: 1px solid #30363d; display: flex; gap: 8px; }
-  #chat-input { flex: 1; resize: none; height: 36px; font-family: inherit; }
-  #chat-send { padding: 6px 14px; }
+  #chat-input { flex: 1; resize: none; height: 40px; font-family: inherit; font-size: 16px; }
+  #chat-send { padding: 8px 14px; }
+  @media (min-width: 768px) {
+    .topbar { padding: 0 20px; height: 56px; }
+    .logo-img { height: 44px; width: 44px; margin-right: 12px; }
+    .logo-text { font-size: 18px; margin-right: 20px; }
+    .nav a { padding: 8px 12px; font-size: 13px; }
+    .topbar-right { display: flex; margin-left: auto; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
+    .content { padding: 20px; }
+    .row { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-bottom: 20px; }
+    .card { padding: 16px; }
+    .coin-badge { width: 36px; height: 36px; font-size: 14px; }
+    .coin-name { font-size: 18px; }
+    .price { font-size: 22px; }
+    .stat-row { font-size: 13px; margin: 5px 0; }
+    .data-table th { padding: 10px 24px; font-size: 11px; }
+    .data-table td { padding: 10px 24px; }
+    .trade-table th { padding: 7px 10px; font-size: 11px; }
+    .trade-table td { padding: 6px 10px; }
+    .form-label { min-width: 180px; }
+    input[type=text], input[type=number], input[type=password], select, textarea { font-size: 13px; padding: 6px 10px; }
+    #chat-panel { left: auto; right: 24px; width: 360px; bottom: 88px; max-height: 480px; }
+    #chat-input { font-size: 13px; height: 36px; }
+    #chat-btn { bottom: 24px; right: 24px; width: 52px; height: 52px; font-size: 22px; }
+  }
 """
 
 def page_shell(title, active_nav, body, extra_js="", user=None):
