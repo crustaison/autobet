@@ -1435,10 +1435,66 @@ def decision_loop():
                     entry      = float(result.get("entry", 0))
                     confidence = float(result.get("confidence", 0.5))
                     rationale  = result.get("rationale", "")
-                    # Append engine suggestion hint to rationale for audit trail
+                    # ── Engine suggestion / auto-switch ─────────────────────────
                     sug_eng = result.get("suggest_engine")
-                    if sug_eng and sug_eng in ("rules_engine", "vector_knn", "hybrid"):
-                        rationale = rationale.rstrip(".") + f" [suggests: {sug_eng}]"
+                    VALID_ENGINES = ("rules_engine", "vector_knn", "hybrid", "minimax_llm")
+                    AUTO_SWITCH_THRESHOLD = 3   # consecutive same suggestions to trigger switch
+                    AUTO_SWITCH_BACK_WR   = 0.38 # if non-LLM engine WR drops below this, revert
+                    try:
+                        current_engine = get_engine_for_coin(coin)
+                        # --- Auto-switch BACK to minimax_llm if non-LLM engine is underperforming ---
+                        if current_engine != "minimax_llm":
+                            wr_rows = conn.execute("""
+                                SELECT result FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS')
+                                ORDER BY window_ts DESC LIMIT 10
+                            """, (coin,)).fetchall()
+                            if len(wr_rows) >= 5:
+                                wr = sum(1 for r in wr_rows if r[0]=='WIN') / len(wr_rows)
+                                if wr < AUTO_SWITCH_BACK_WR:
+                                    conn.execute("""
+                                        INSERT OR REPLACE INTO market_group_engines (coin, engine_key, updated_at)
+                                        VALUES (?, 'minimax_llm', ?)
+                                    """, (coin, now_cst().isoformat()))
+                                    conn.commit()
+                                    # Reset suggestion streak
+                                    conn.execute("DELETE FROM settings WHERE key=?", (f"engine_suggest_{coin}",))
+                                    conn.commit()
+                                    audit("engine_auto_switched", "market_group_engines", coin,
+                                          {"from": current_engine, "to": "minimax_llm",
+                                           "reason": f"WR {wr:.0%} < {AUTO_SWITCH_BACK_WR:.0%} over last {len(wr_rows)} trades"})
+                                    print(f"[ENGINE] {coin}: auto-reverted to minimax_llm (WR {wr:.0%} on {current_engine})")
+                        # --- Track suggestion streak and auto-switch forward ---
+                        if sug_eng and sug_eng in VALID_ENGINES and sug_eng != current_engine:
+                            streak_row = conn.execute(
+                                "SELECT value FROM settings WHERE key=?", (f"engine_suggest_{coin}",)
+                            ).fetchone()
+                            # value format: "engine_key:count"
+                            if streak_row and streak_row[0].startswith(sug_eng + ":"):
+                                streak = int(streak_row[0].split(":")[1]) + 1
+                            else:
+                                streak = 1
+                            conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                                         (f"engine_suggest_{coin}", f"{sug_eng}:{streak}", now_cst().isoformat()))
+                            conn.commit()
+                            rationale = rationale.rstrip(".") + f" [suggests: {sug_eng} {streak}/{AUTO_SWITCH_THRESHOLD}]"
+                            if streak >= AUTO_SWITCH_THRESHOLD:
+                                conn.execute("""
+                                    INSERT OR REPLACE INTO market_group_engines (coin, engine_key, updated_at)
+                                    VALUES (?, ?, ?)
+                                """, (coin, sug_eng, now_cst().isoformat()))
+                                conn.commit()
+                                conn.execute("DELETE FROM settings WHERE key=?", (f"engine_suggest_{coin}",))
+                                conn.commit()
+                                audit("engine_auto_switched", "market_group_engines", coin,
+                                      {"from": current_engine, "to": sug_eng,
+                                       "reason": f"LLM suggested {AUTO_SWITCH_THRESHOLD} consecutive windows"})
+                                print(f"[ENGINE] {coin}: auto-switched {current_engine} → {sug_eng} (LLM suggested {AUTO_SWITCH_THRESHOLD}x)")
+                        elif not sug_eng or sug_eng == current_engine:
+                            # Clear streak if LLM stops suggesting or agrees with current engine
+                            conn.execute("DELETE FROM settings WHERE key=?", (f"engine_suggest_{coin}",))
+                            conn.commit()
+                    except Exception as _se:
+                        print(f"[ENGINE SUGGEST] {coin}: {_se}")
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
                         print(f"[SKIP] {coin} wts={wts}: bad engine result dir={direction} entry={entry}")
                         return
