@@ -2707,7 +2707,7 @@ def build_dashboard(user=None):
     recent_cutoff = int(time.time()) - 1800  # only show orders from last 30 min
     for coin in COINS:
         row = conn.execute(
-            "SELECT direction, contracts, status, error, created_at FROM live_orders WHERE coin=? AND window_ts>=? ORDER BY id DESC LIMIT 1",
+            "SELECT direction, contracts, status, error, created_at, window_ts, avg_fill_price, filled_contracts FROM live_orders WHERE coin=? AND window_ts>=? ORDER BY id DESC LIMIT 1",
             (coin, recent_cutoff)
         ).fetchone()
         coin_last_order[coin] = row
@@ -2782,17 +2782,56 @@ def build_dashboard(user=None):
         last_order = coin_last_order.get(coin)
         if coin_is_live:
             if last_order:
-                lo_dir, lo_contracts, lo_status, lo_error, lo_time = last_order
-                lo_color = {"placed": "#e3b341", "filled": "#3fb950", "failed": "#f85149", "canceled": "#8b949e"}.get(lo_status, "#8b949e")
-                lo_icon  = {"placed": "⏳", "filled": "✓", "failed": "✗", "canceled": "–"}.get(lo_status, "?")
+                lo_dir, lo_contracts, lo_status, lo_error, lo_time, lo_wts, lo_avg_price, lo_filled = last_order
+                lo_color = {"placed": "#e3b341", "filled": "#3fb950", "failed": "#f85149", "canceled": "#8b949e", "executed": "#3fb950", "filled_partial": "#e3b341"}.get(lo_status, "#8b949e")
+                lo_icon  = {"placed": "⏳", "filled": "✓", "failed": "✗", "canceled": "–", "executed": "✓", "filled_partial": "~"}.get(lo_status, "?")
                 lo_label = f'{lo_icon} {lo_status}'
                 if lo_status == "failed" and lo_error:
                     short_err = lo_error.replace("HTTP 401: ", "").replace('{"error":{"code":"authentication_error","message":"authentication_error","details":"', "").rstrip('"}')[:30]
                     lo_label += f' — {short_err}'
-                live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid {lo_color};display:flex;align-items:center;gap:6px" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
-                                 f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
-                                 f'<span style="font-size:11px;color:{lo_color};font-weight:600">{lo_label}</span>' \
-                                 f'<span style="font-size:10px;color:#555;margin-left:auto">{lo_contracts}c</span></div>'
+
+                # Active position block — show unrealized P&L and market movement
+                is_active = (lo_wts == wts and lo_status in ("filled", "executed", "filled_partial")
+                             and lo_filled and lo_avg_price)
+                if is_active and yes_bid and yes_ask:
+                    n = int(lo_filled or 0)
+                    avg_p = float(lo_avg_price or 0)
+                    # Current value and unrealized P&L
+                    if lo_dir == "NO":
+                        cur_val = 1.0 - yes_bid          # what NO is worth now
+                        unreal  = n * (cur_val - avg_p)
+                    else:
+                        cur_val = yes_bid
+                        unreal  = n * (cur_val - avg_p)
+                    unreal_color = "#3fb950" if unreal >= 0 else "#f85149"
+                    unreal_s = f'+${unreal:.2f}' if unreal >= 0 else f'-${abs(unreal):.2f}'
+                    # Time progress bar (window is 900s)
+                    elapsed_pct = min(100, max(0, (900 - secs_left) / 900 * 100))
+                    bar_color = "#3fb950" if unreal >= 0 else "#f85149"
+                    entry_s = f"{avg_p*100:.0f}¢"
+                    cur_s   = f"{cur_val*100:.0f}¢"
+                    live_indicator = f'''<div style="margin-top:6px;padding:6px 10px;border-radius:6px;background:#0d1117;border:1px solid {lo_color}" onclick="event.stopPropagation();window.location='/fill-quality'">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
+    <span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>
+    <span style="font-size:11px;color:{lo_color};font-weight:700">{lo_dir}</span>
+    <span style="font-size:10px;color:#8b949e">{n}c @ {entry_s}</span>
+    <span style="font-size:10px;color:#8b949e">→</span>
+    <span style="font-size:11px;font-weight:700;color:{unreal_color}">{cur_s}</span>
+    <span style="font-size:11px;font-weight:700;color:{unreal_color};margin-left:auto">{unreal_s}</span>
+  </div>
+  <div style="height:3px;background:#21262d;border-radius:2px">
+    <div style="width:{elapsed_pct:.0f}%;height:100%;background:{bar_color};border-radius:2px;transition:width 1s"></div>
+  </div>
+  <div style="display:flex;justify-content:space-between;margin-top:2px">
+    <span style="font-size:9px;color:#555">{900-secs_left:.0f}s elapsed</span>
+    <span style="font-size:9px;color:#555">{secs_left}s left</span>
+  </div>
+</div>'''
+                else:
+                    live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid {lo_color};display:flex;align-items:center;gap:6px" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
+                                     f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
+                                     f'<span style="font-size:11px;color:{lo_color};font-weight:600">{lo_label}</span>' \
+                                     f'<span style="font-size:10px;color:#555;margin-left:auto">{lo_contracts}c</span></div>'
             else:
                 live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid #30363d;display:flex;align-items:center;gap:6px">' \
                                  f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
