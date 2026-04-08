@@ -238,7 +238,8 @@ def sync_live_orders():
         conn = db_connect()
         pending = conn.execute(
             "SELECT id, coin, window_ts, ticker, direction, contracts, order_id "
-            "FROM live_orders WHERE status='placed' AND order_id IS NOT NULL"
+            "FROM live_orders WHERE status IN ('placed','filled','filled_partial','executed') "
+            "AND order_id IS NOT NULL AND (filled_contracts IS NULL OR filled_contracts = 0)"
         ).fetchall()
         conn.close()
         for row in pending:
@@ -248,9 +249,14 @@ def sync_live_orders():
                 continue
             order = resp.get("order", {})
             status = order.get("status", "")
-            filled_count = order.get("contracts_filled", 0) or 0
-            avg_price_cents = order.get("avg_fill_price", 0) or 0
-            avg_price = avg_price_cents / 100.0 if avg_price_cents else 0.0
+            # Kalshi v2 API uses fill_count_fp (string) and {side}_price_dollars (already in dollars)
+            filled_count = float(order.get("fill_count_fp") or order.get("contracts_filled") or 0)
+            side = order.get("side", direction.lower())  # "yes" or "no"
+            price_key = f"{side}_price_dollars"
+            avg_price = float(order.get(price_key) or order.get("avg_fill_price") or 0)
+            # avg_fill_price legacy field was in cents; price_dollars fields are already dollars
+            if price_key not in order and avg_price > 1:
+                avg_price = avg_price / 100.0
             new_status = {"filled": "filled", "executed": "filled", "canceled": "canceled",
                           "resting": "placed", "partially_filled": "filled_partial"}.get(status, status)
             # Detect partial fill when Kalshi reports "filled" but count < requested
@@ -1073,7 +1079,7 @@ def get_price_at(conn, coin, ts, tol=120):
     """, (coin, ts, tol, ts)).fetchone()
     return row[0] if row else None
 
-def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None):
+def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None, rules_signal=None, knn_signal=None):
     if not MINIMAX_KEY:
         return None
     vol_line = ""
@@ -1083,18 +1089,35 @@ def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=
     spread_line = ""
     if spread is not None:
         spread_line = f"\nCurrent bid-ask spread: {spread:.3f} ({'tight' if spread < 0.05 else 'wide — slippage risk'})"
+    # Build quantitative signal context from rules and KNN
+    quant_lines = []
+    if rules_signal:
+        rd = rules_signal.get("direction")
+        re_ = rules_signal.get("entry", 0)
+        mid = re_ if rd == "YES" else round(1 - re_, 3)
+        quant_lines.append(f"Rules engine (order book mid): {rd} — market mid={mid:.3f} ({'above 0.62 YES threshold' if mid > 0.62 else 'below 0.38 NO threshold' if mid < 0.38 else 'neutral zone'})")
+    if knn_signal:
+        kd = knn_signal.get("direction")
+        kc = knn_signal.get("confidence", 0)
+        kr = knn_signal.get("rationale", "")
+        quant_lines.append(f"KNN pattern match: {kd} — {kr} (confidence={kc:.2f})")
+    if not quant_lines:
+        quant_block = ""
+    else:
+        quant_block = "\n\nQuantitative signals (computed from live order book + historical patterns):\n" + "\n".join(f"- {l}" for l in quant_lines) + "\nThese are data-driven inputs. Use them as evidence but apply your own judgment — override with clear reasoning if your analysis disagrees."
     prompt = f"""You are a quantitative analyst evaluating a 15-minute {coin} price direction signal.
 
 Current {coin} spot price: ${coin_price:,.2f}{vol_line}{spread_line}
 
 Order book snapshots from the last 5 minutes (yes_bid = probability market pays for UP outcome, yes_ask = cost to acquire UP position):
-{ticks_summary}
+{ticks_summary}{quant_block}
 
 Task: Predict whether {coin} price will be HIGHER or LOWER in 15 minutes.
 - If HIGHER: direction=YES, entry=yes_ask value
 - If LOWER: direction=NO, entry=(1 - yes_bid) value
 - Factor in volume: low-volume markets have weaker price discovery and higher reversal risk.
 - Wide spreads increase slippage cost — only trade if conviction is high.
+- If quantitative signals above strongly agree on a direction, weight that heavily.
 
 Respond with JSON only, no explanation:
 {{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line technical reason"}}"""
@@ -1669,8 +1692,12 @@ def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_v
         return vector_knn_engine(coin, mkt, ticks)
     elif engine_key == "hybrid":
         return hybrid_engine(coin, mkt, ticks)
-    else:  # minimax_llm default
-        return minimax_analyze(coin, ticks_summary, coin_price, market_volume=market_volume, spread=spread)
+    else:  # minimax_llm default — enrich with rules + KNN signals
+        rules_sig = rules_engine(coin, mkt)
+        knn_sig = vector_knn_engine(coin, mkt, ticks)
+        return minimax_analyze(coin, ticks_summary, coin_price,
+                               market_volume=market_volume, spread=spread,
+                               rules_signal=rules_sig, knn_signal=knn_sig)
 
 def rules_engine(coin, mkt):
     try:
