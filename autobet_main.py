@@ -1813,6 +1813,9 @@ SHARED_CSS = """
   .trade-table { width: 100%; border-collapse: collapse; font-size: 12px; }
   .trade-table th { text-align: left; padding: 7px 10px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
   .trade-table td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
+  .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .data-table th { text-align: left; padding: 8px 16px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+  .data-table td { padding: 7px 16px; border-bottom: 1px solid #21262d; white-space: nowrap; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
   .badge-win  { background: #1a2f1a; color: #3fb950; border: 1px solid #238636; }
   .badge-loss { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
@@ -2898,9 +2901,12 @@ def build_fill_quality_page(user=None):
         "SELECT coin, window_ts, direction, entry, requested_contracts, available_contracts, filled_contracts, liquidity_ok, created_at "
         "FROM fill_quality ORDER BY id DESC LIMIT 50"
     ).fetchall()
+    import time as _time
+    recent_2h = int(_time.time()) - 7200
     live_rows = conn.execute(
         "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, filled_contracts, avg_fill_price, created_at "
-        "FROM live_orders ORDER BY id DESC LIMIT 30"
+        "FROM live_orders WHERE status != 'failed' OR window_ts >= ? ORDER BY id DESC LIMIT 30",
+        (recent_2h,)
     ).fetchall()
     conn.close()
 
