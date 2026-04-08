@@ -171,6 +171,49 @@ def kalshi_get(path, params=None):
         print(f"[KALSHI] GET {path}: {e}")
         return None
 
+def kalshi_post(path, body_dict):
+    url = KALSHI_BASE + path
+    hdrs = kalshi_auth_headers("POST", "/trade-api/v2" + path)
+    hdrs["Content-Type"] = "application/json"
+    data = json.dumps(body_dict).encode()
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode()), None
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        print(f"[KALSHI] POST {path} HTTP {e.code}: {err_body}")
+        return None, f"HTTP {e.code}: {err_body}"
+    except Exception as e:
+        print(f"[KALSHI] POST {path}: {e}")
+        return None, str(e)
+
+def place_kalshi_order(ticker, direction, contracts, entry):
+    """
+    Place a market/limit order on Kalshi.
+    direction: "YES" or "NO"
+    contracts: integer number of contracts
+    entry: limit price (0.01–0.99), used as limit to avoid slippage
+    Returns (order_id, error_str)
+    """
+    side = "yes" if direction == "YES" else "no"
+    # Kalshi prices are in cents (integer 1-99)
+    limit_price = max(1, min(99, round(entry * 100)))
+    body = {
+        "ticker": ticker,
+        "client_order_id": f"autobet_{ticker}_{int(time.time())}",
+        "type": "limit",
+        "action": "buy",
+        "side": side,
+        "count": int(contracts),
+        "yes_price": limit_price if direction == "YES" else (100 - limit_price),
+    }
+    resp, err = kalshi_post("/portfolio/orders", body)
+    if err:
+        return None, err
+    order_id = (resp or {}).get("order", {}).get("order_id")
+    return order_id, None
+
 # ── Kalshi order book liquidity ─────────────────────────────────────────────────
 _ob_cache = {}   # ticker -> (fetched_ts, orderbook_fp dict)
 _ob_lock  = threading.Lock()
@@ -412,6 +455,19 @@ def db_init():
             available_contracts REAL,
             filled_contracts REAL,
             liquidity_ok INTEGER,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS live_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            coin TEXT NOT NULL,
+            window_ts INTEGER NOT NULL,
+            ticker TEXT,
+            direction TEXT,
+            contracts INTEGER,
+            limit_price INTEGER,
+            order_id TEXT,
+            status TEXT DEFAULT 'placed',
+            error TEXT,
             created_at TEXT
         );
     """)
@@ -1126,6 +1182,35 @@ def decision_loop():
                     conn.commit()
                     liq_note = f"  avail={available:.0f}" if available is not None else "  (ob unavail)"
                     print(f"[DECISION] {coin} wts={wts}: {direction} @ {entry:.3f}  conf={confidence:.2f}  contracts={contracts:.1f}{liq_note}  '{rationale[:50]}'")
+
+                    # ── Live order placement ─────────────────────────────────
+                    try:
+                        coin_mode_row = conn2 = None
+                        conn2 = db_connect()
+                        global_live = conn2.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
+                        coin_mode_row = conn2.execute("SELECT mode FROM coin_modes WHERE coin=?", (coin,)).fetchone()
+                        conn2.close()
+                        is_live = (global_live and global_live[0]) and (coin_mode_row and coin_mode_row[0] == "live")
+                        if is_live and ticker:
+                            live_contracts = max(1, int(contracts))
+                            order_id, order_err = place_kalshi_order(ticker, direction, live_contracts, entry)
+                            conn3 = db_connect()
+                            conn3.execute("""
+                                INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
+                                    limit_price, order_id, status, error, created_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,?)
+                            """, (coin, wts, ticker, direction, live_contracts,
+                                  max(1, min(99, round(entry*100))),
+                                  order_id, "placed" if order_id else "failed",
+                                  order_err, now_cst().isoformat()))
+                            conn3.commit()
+                            conn3.close()
+                            if order_id:
+                                print(f"[LIVE] {coin} order placed: {order_id}  {direction} x{live_contracts} @ {entry:.3f}")
+                            else:
+                                print(f"[LIVE] {coin} order FAILED: {order_err}")
+                    except Exception as le:
+                        print(f"[LIVE] {coin} order exception: {le}")
                 except Exception as e:
                     print(f"[DECISION] {coin}: {e}")
                     traceback.print_exc()
@@ -2686,6 +2771,36 @@ def build_fill_quality_page(user=None):
             dir_color = "#3fb950" if direction == "YES" else "#f85149"
             body += f'<tr><td>{ts}</td><td>{coin}</td><td style="color:{dir_color}">{direction}</td>'
             body += f'<td>{entry:.4f}</td><td>{req_s}</td><td>{avail_s}</td><td>{filled_s}</td><td>{status}</td></tr>\n'
+        body += '</table>\n</div>\n'
+
+    # Live orders section
+    body += '<div class="page-header" style="margin-top:24px">Live Orders</div>\n'
+    body += '<div class="page-sub">Real Kalshi orders placed when live mode is enabled.</div>\n'
+    conn2 = db_connect()
+    live_rows = conn2.execute(
+        "SELECT coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, error, created_at "
+        "FROM live_orders ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+    conn2.close()
+    if not live_rows:
+        body += '<div class="card"><p class="muted">No live orders yet. Enable global live toggle + set a coin to live mode to start placing real orders.</p></div>\n'
+    else:
+        body += '<div class="card" style="overflow-x:auto">\n<table class="data-table">\n'
+        body += '<tr><th>Time</th><th>Coin</th><th>Ticker</th><th>Dir</th><th>Contracts</th><th>Limit¢</th><th>Order ID</th><th>Status</th><th>Error</th></tr>\n'
+        import datetime as _dt2
+        for r in live_rows:
+            coin, wts, ticker, direction, contracts, limit_price, order_id, status, error, created_at = r
+            try:
+                ts = _dt2.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
+            except:
+                ts = str(wts)
+            dir_color = "#3fb950" if direction == "YES" else "#f85149"
+            status_color = "#3fb950" if status == "placed" else "#f85149"
+            oid = f'<span style="font-family:monospace;font-size:10px">{(order_id or "")[:16]}…</span>' if order_id else "—"
+            body += f'<tr><td>{ts}</td><td>{coin}</td><td style="font-family:monospace;font-size:11px">{ticker or "—"}</td>'
+            body += f'<td style="color:{dir_color}">{direction}</td><td>{contracts}</td><td>{limit_price}¢</td>'
+            body += f'<td>{oid}</td><td style="color:{status_color}">{status}</td>'
+            body += f'<td style="font-size:11px;color:#f85149">{(error or "")[:60]}</td></tr>\n'
         body += '</table>\n</div>\n'
 
     return page_shell("Fill Quality", "/fill-quality", body, user=user)
