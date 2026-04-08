@@ -1210,8 +1210,43 @@ Respond with JSON only:
                 print(f"[ENGINE HINT] {coin}: LLM suggests switching to {sug} — {result.get('rationale','')[:60]}")
             return result
     except Exception as e:
-        print(f"[MINIMAX] {coin}: {e}")
-        return None
+        print(f"[MINIMAX] {coin}: {e} — trying local fallback")
+        return local_llm_analyze(coin, prompt)
+
+def local_llm_analyze(coin, prompt):
+    """
+    Fallback to local Qwen3.5-35B-A3B via nexa infer subprocess.
+    Uses /no_think prefix to skip chain-of-thought and return JSON in ~25-35s.
+    """
+    try:
+        import subprocess as _sp, re as _re
+        nexa_cli = "/opt/nexa_sdk/nexa-cli"
+        model    = "unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M"
+        # Prepend /no_think to suppress chain-of-thought
+        local_prompt = "/no_think\n\n" + prompt
+        t0 = time.time()
+        result = _sp.run(
+            [nexa_cli, "infer", model,
+             "--max-tokens", "300", "--hide-think",
+             "-p", local_prompt],
+            capture_output=True, text=True, timeout=90
+        )
+        elapsed = time.time() - t0
+        # Strip ANSI escape codes and spinner lines
+        raw = _re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]|\r', '', result.stdout + result.stderr)
+        # Extract first valid JSON object
+        for m in _re.finditer(r'\{[^{}]+\}', raw, _re.DOTALL):
+            try:
+                parsed = json.loads(m.group())
+                if parsed.get("direction") in ("YES", "NO") and parsed.get("entry"):
+                    print(f"[LOCAL LLM] {coin}: {parsed['direction']} @ {parsed['entry']} conf={parsed.get('confidence',0):.2f} ({elapsed:.1f}s)")
+                    return parsed
+            except Exception:
+                pass
+        print(f"[LOCAL LLM] {coin}: no valid JSON in output ({elapsed:.1f}s)")
+    except Exception as le:
+        print(f"[LOCAL LLM] {coin}: {le}")
+    return None
 
 def format_ticks_summary(ticks):
     if not ticks:
