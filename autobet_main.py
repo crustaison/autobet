@@ -62,10 +62,15 @@ KALSHI_PEM = Path.home() / "autobet" / "kalshi.key"
 LOGO_PATH  = Path.home() / "autobet" / "logo.jpg"
 
 PORT = 7778
-COINS = ["BTC", "XRP", "SOL", "ETH"]
-SERIES = {"BTC": "KXBTC15M", "XRP": "KXXRP15M", "SOL": "KXSOL15M", "ETH": "KXETH15M"}
-COIN_COLORS  = {"BTC": "#f7931a", "XRP": "#0066cc", "SOL": "#9945ff", "ETH": "#627eea"}
-COIN_LETTERS = {"BTC": "B", "XRP": "X", "SOL": "S", "ETH": "E"}
+COINS = ["BTC", "XRP", "SOL", "ETH", "DOGE", "BNB", "HYPE"]
+SERIES = {"BTC": "KXBTC15M", "XRP": "KXXRP15M", "SOL": "KXSOL15M", "ETH": "KXETH15M",
+          "DOGE": "KXDOGE15M", "BNB": "KXBNB15M", "HYPE": "KXHYPE15M"}
+COIN_COLORS  = {"BTC": "#f7931a", "XRP": "#0066cc", "SOL": "#9945ff", "ETH": "#627eea",
+                "DOGE": "#c2a633", "BNB": "#f3ba2f", "HYPE": "#00e5ff"}
+COIN_LETTERS = {"BTC": "B", "XRP": "X", "SOL": "S", "ETH": "E",
+                "DOGE": "D", "BNB": "N", "HYPE": "H"}
+# Coins not on Coinbase — use alternate price source
+COIN_PRICE_OVERRIDE = {"HYPE": "https://api.coingecko.com/api/v3/simple/price?ids=hyperliquid&vs_currencies=usd"}
 
 KALSHI_BASE   = "https://api.elections.kalshi.com/trade-api/v2"
 POLYMARKET_BASE = "https://clob.polymarket.com"
@@ -77,7 +82,7 @@ TRADE_SIZE       = 20.0
 KALSHI_FEE_RATE  = 0.07
 MAX_CONTRACTS    = 500    # Realistic Kalshi order book depth at any price
 ENTRY_FLOOR      = 0.05   # Below this = lottery ticket; liquidity impossible
-ENTRY_CEILING    = 0.95   # Above this = negative EV confirmed across all coins
+ENTRY_CEILING    = 0.80   # Above this = negative EV confirmed across all coins (data: 0.8+ entry = -$1,886 net)
 
 # ── Load environment ────────────────────────────────────────────────────────────
 def load_env():
@@ -246,7 +251,12 @@ def sync_live_orders():
             filled_count = order.get("contracts_filled", 0) or 0
             avg_price_cents = order.get("avg_fill_price", 0) or 0
             avg_price = avg_price_cents / 100.0 if avg_price_cents else 0.0
-            new_status = {"filled": "filled", "canceled": "canceled", "resting": "placed"}.get(status, status)
+            new_status = {"filled": "filled", "executed": "filled", "canceled": "canceled",
+                          "resting": "placed", "partially_filled": "filled_partial"}.get(status, status)
+            # Detect partial fill when Kalshi reports "filled" but count < requested
+            filled_count = int(filled_count)
+            if new_status == "filled" and filled_count > 0 and filled_count < int(contracts or 0):
+                new_status = "filled_partial"
             conn2 = db_connect()
             conn2.execute(
                 "UPDATE live_orders SET status=?, filled_contracts=?, avg_fill_price=? WHERE id=?",
@@ -254,8 +264,9 @@ def sync_live_orders():
             )
             conn2.commit()
             conn2.close()
-            if new_status == "filled" and filled_count > 0 and avg_price > 0:
-                print(f"[LIVE] {coin} order {order_id[:12]} filled: {filled_count} contracts @ {avg_price:.3f}")
+            if new_status in ("filled", "filled_partial") and filled_count > 0 and avg_price > 0:
+                fill_note = " (partial)" if new_status == "filled_partial" else ""
+                print(f"[LIVE] {coin} order {order_id[:12]} filled{fill_note}: {filled_count} contracts @ {avg_price:.3f}")
     except Exception as e:
         print(f"[LIVE SYNC] {e}")
 
@@ -285,8 +296,14 @@ def sync_kalshi_balance():
         if not (global_live and global_live[0]) or not live_coins:
             conn.close()
             return
-        # If exactly one live coin, its paper balance = Kalshi balance
-        if len(live_coins) == 1:
+        # Always write pool_balance = real Kalshi balance
+        conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('pool_balance',?,?)",
+                     (str(round(kalshi_bal, 2)), now_cst().isoformat()))
+        conn.commit()
+        # If exactly one live coin and not pool mode, sync its paper balance too
+        pool_row = conn.execute("SELECT value FROM settings WHERE key='pool_mode'").fetchone()
+        pool_on = pool_row and pool_row[0] == "1"
+        if not pool_on and len(live_coins) == 1:
             coin = live_coins[0]
             old = conn.execute("SELECT capital FROM paper_accounts WHERE coin=?", (coin,)).fetchone()
             old_bal = old[0] if old else 0
@@ -314,6 +331,7 @@ def live_order_sync_loop():
 # ── Kalshi order book liquidity ─────────────────────────────────────────────────
 _ob_cache = {}   # ticker -> (fetched_ts, orderbook_fp dict)
 _ob_lock  = threading.Lock()
+_pool_last_placed_wts = 0   # prevents duplicate pool orders in the same window
 
 def fetch_orderbook(ticker):
     """Return orderbook_fp dict for ticker, cached 45s. Returns None on error."""
@@ -378,6 +396,14 @@ def db_migrate(conn):
     if cols and "run_id" not in cols:
         conn.execute("ALTER TABLE paper_trades ADD COLUMN run_id INTEGER")
         print("[DB] Added run_id to paper_trades")
+
+    # live_orders: add settlement columns if missing
+    lo_cols = [r[1] for r in conn.execute("PRAGMA table_info(live_orders)").fetchall()]
+    if lo_cols:
+        for col, typedef in [("pnl", "REAL"), ("actual_direction", "TEXT"), ("resolved_at", "TEXT")]:
+            if col not in lo_cols:
+                conn.execute(f"ALTER TABLE live_orders ADD COLUMN {col} {typedef}")
+                print(f"[DB] Added {col} to live_orders")
 
     conn.commit()
 
@@ -567,6 +593,9 @@ def db_init():
             error TEXT,
             filled_contracts INTEGER,
             avg_fill_price REAL,
+            pnl REAL,
+            actual_direction TEXT,
+            resolved_at TEXT,
             created_at TEXT
         );
     """)
@@ -581,6 +610,11 @@ def db_init():
     conn.execute("""
         INSERT OR IGNORE INTO risk_settings (id, updated_at) VALUES (1, ?)
     """, (now_cst().isoformat(),))
+
+    # Seed default filter settings (won't overwrite existing values)
+    for k, v in [("min_confidence", "0.55"), ("min_volume", "500")]:
+        conn.execute("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                     (k, v, now_cst().isoformat()))
 
     # Ensure paper accounts exist for all coins
     for coin in COINS:
@@ -700,6 +734,15 @@ _health_status = {}   # key -> {ok, msg, ts}
 
 # ── Price collection ────────────────────────────────────────────────────────────
 def fetch_coinbase_price(coin):
+    if coin in COIN_PRICE_OVERRIDE:
+        try:
+            url = COIN_PRICE_OVERRIDE[coin]
+            with urllib.request.urlopen(url, timeout=5) as r:
+                data = json.loads(r.read().decode())
+            # CoinGecko format: {"hyperliquid": {"usd": 12.34}}
+            return float(list(data.values())[0]["usd"])
+        except:
+            return None
     url = COINBASE_URL.format(coin)
     try:
         with urllib.request.urlopen(url, timeout=5) as r:
@@ -1030,12 +1073,19 @@ def get_price_at(conn, coin, ts, tol=120):
     """, (coin, ts, tol, ts)).fetchone()
     return row[0] if row else None
 
-def minimax_analyze(coin, ticks_summary, coin_price):
+def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None):
     if not MINIMAX_KEY:
         return None
+    vol_line = ""
+    if market_volume is not None:
+        vol_activity = "HIGH" if market_volume >= 2000 else ("MODERATE" if market_volume >= 500 else "LOW")
+        vol_line = f"\n24h market volume: {int(market_volume):,} contracts ({vol_activity} activity)"
+    spread_line = ""
+    if spread is not None:
+        spread_line = f"\nCurrent bid-ask spread: {spread:.3f} ({'tight' if spread < 0.05 else 'wide — slippage risk'})"
     prompt = f"""You are a quantitative analyst evaluating a 15-minute {coin} price direction signal.
 
-Current {coin} spot price: ${coin_price:,.2f}
+Current {coin} spot price: ${coin_price:,.2f}{vol_line}{spread_line}
 
 Order book snapshots from the last 5 minutes (yes_bid = probability market pays for UP outcome, yes_ask = cost to acquire UP position):
 {ticks_summary}
@@ -1043,6 +1093,8 @@ Order book snapshots from the last 5 minutes (yes_bid = probability market pays 
 Task: Predict whether {coin} price will be HIGHER or LOWER in 15 minutes.
 - If HIGHER: direction=YES, entry=yes_ask value
 - If LOWER: direction=NO, entry=(1 - yes_bid) value
+- Factor in volume: low-volume markets have weaker price discovery and higher reversal risk.
+- Wide spreads increase slippage cost — only trade if conviction is high.
 
 Respond with JSON only, no explanation:
 {{"direction": "YES" or "NO", "entry": 0.XX, "confidence": 0.0-1.0, "rationale": "one line technical reason"}}"""
@@ -1164,8 +1216,66 @@ def resolve_trades():
     conn.commit()
     conn.close()
 
+def resolve_live_orders():
+    """
+    For filled live orders whose window has closed, fetch the Kalshi market
+    settlement outcome and record actual P&L. Runs alongside resolve_trades().
+    """
+    now = int(time.time())
+    conn = db_connect()
+    orders = conn.execute("""
+        SELECT id, coin, window_ts, ticker, direction, filled_contracts, avg_fill_price
+        FROM live_orders
+        WHERE status IN ('filled', 'filled_partial', 'executed')
+          AND resolved_at IS NULL
+          AND ? > window_ts + 1020
+    """, (now,)).fetchall()
+    conn.close()
+
+    for row in orders:
+        lo_id, coin, wts, ticker, direction, filled_count, avg_price = row
+        if not ticker or not filled_count or not avg_price:
+            continue
+        filled_count = int(filled_count)
+        avg_price = float(avg_price)
+
+        # Fetch settled market from Kalshi to get actual outcome
+        mkt_data = kalshi_get(f"/markets/{ticker}")
+        if not mkt_data:
+            continue
+        mkt = mkt_data.get("market", mkt_data)
+        kalshi_result = (mkt.get("result") or "").lower()  # "yes" or "no"
+        if kalshi_result not in ("yes", "no"):
+            # Market not settled yet — try again next cycle
+            continue
+
+        actual_direction = "YES" if kalshi_result == "yes" else "NO"
+        won = (direction == actual_direction)
+
+        if won:
+            gross = filled_count * (1.0 - avg_price)
+            fee_per = min(KALSHI_FEE_RATE * avg_price * (1.0 - avg_price), 0.02)
+            fee = filled_count * fee_per
+            pnl = round(gross - fee, 4)
+        else:
+            pnl = round(-(filled_count * avg_price), 4)
+
+        conn2 = db_connect()
+        conn2.execute("""
+            UPDATE live_orders SET pnl=?, actual_direction=?, resolved_at=? WHERE id=?
+        """, (pnl, actual_direction, now_cst().isoformat(), lo_id))
+        conn2.commit()
+        conn2.close()
+        result_str = "WIN" if won else "LOSS"
+        print(f"[LIVE RESOLVE] {coin} wts={wts} {direction} vs {actual_direction} -> {result_str}  pnl={pnl:+.4f}")
+        audit("live_order_resolved", "live_order", str(lo_id),
+              {"coin": coin, "wts": wts, "direction": direction,
+               "actual": actual_direction, "result": result_str, "pnl": pnl})
+
+
 def decision_loop():
     time.sleep(10)
+    last_decided_wts = 0
     while True:
         try:
             wts = kalshi_window_ts()
@@ -1174,7 +1284,10 @@ def decision_loop():
             if secs_into > 180:
                 time.sleep(30)
                 continue
-            def _decide_coin(coin, wts, now):
+            if wts <= last_decided_wts:
+                time.sleep(30)
+                continue
+            def _decide_coin(coin, wts, now, pool_signals=None, pool_lock=None):
               try:
                 conn = db_connect()
                 try:
@@ -1193,6 +1306,29 @@ def decision_loop():
                     prev_wts = wts - 900
                     ticks = get_recent_ticks(conn, coin, prev_wts, n=10)
                     ticks_summary = format_ticks_summary(ticks)
+
+                    # ── Volume pre-trade filter ──────────────────────────────
+                    market_volume = float(mkt.get("volume") or 0)
+                    yes_bid_v = float(mkt.get("yes_bid") or 0)
+                    yes_ask_v = float(mkt.get("yes_ask") or 0)
+                    spread_v  = round(yes_ask_v - yes_bid_v, 4) if yes_bid_v and yes_ask_v else None
+                    try:
+                        min_vol = float(conn.execute(
+                            "SELECT value FROM settings WHERE key='min_volume'"
+                        ).fetchone()[0])
+                    except Exception:
+                        min_vol = 500.0
+                    if min_vol > 0 and market_volume > 0 and market_volume < min_vol:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
+                              f"Volume PASS: {int(market_volume)} contracts < {int(min_vol)} threshold",
+                              now_cst().isoformat()))
+                        conn.commit()
+                        print(f"[VOLUME] {coin} wts={wts}: PASS — volume {int(market_volume)} < {int(min_vol)}")
+                        return
+
                     # 1. Try betbot autoresearch signal file first
                     bb_dir, bb_entry, bb_size = read_betbot_signal(coin, wts)
                     if bb_dir:
@@ -1201,7 +1337,8 @@ def decision_loop():
                                   "_betbot_size": bb_size}
                     else:
                         # 2. Use configured engine (minimax_llm / rules / knn / hybrid)
-                        result = run_engine(get_engine_for_coin(coin), coin, mkt, ticks, coin_price, ticks_summary)
+                        result = run_engine(get_engine_for_coin(coin), coin, mkt, ticks, coin_price, ticks_summary,
+                                            market_volume=market_volume, spread=spread_v)
 
                     if not result:
                         # Fallback disabled — 160 fallback trades were net negative on every coin
@@ -1218,6 +1355,36 @@ def decision_loop():
                     confidence = float(result.get("confidence", 0.5))
                     rationale  = result.get("rationale", "")
                     if direction not in ("YES", "NO") or entry <= 0 or entry >= 1.0:
+                        return
+
+                    # ── Signal quality filters (data-driven) ────────────────────
+                    # Filter 1: minimum confidence — conf<=0.5 is 47% WR / -$535 in data
+                    try:
+                        min_conf = float(conn.execute(
+                            "SELECT value FROM settings WHERE key='min_confidence'"
+                        ).fetchone()[0])
+                    except Exception:
+                        min_conf = 0.55
+                    is_betbot = bool(result.get("_betbot_size"))
+                    if not is_betbot and confidence <= min_conf:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            VALUES (?,?,?,?,?,?,?)
+                        """, (coin, wts, "PASS", round(entry, 4), confidence,
+                              f"Conf PASS: {confidence:.2f} <= min {min_conf:.2f}", now_cst().isoformat()))
+                        conn.commit()
+                        print(f"[FILTER] {coin} wts={wts}: PASS — confidence {confidence:.2f} below min {min_conf:.2f}")
+                        return
+
+                    # Filter 2: SOL YES above 0.55 entry — 36-43% WR at every bucket above that
+                    if coin == "SOL" and direction == "YES" and entry > 0.55 and not is_betbot:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            VALUES (?,?,?,?,?,?,?)
+                        """, (coin, wts, "PASS", round(entry, 4), confidence,
+                              f"Bias PASS: SOL YES entry {entry:.3f} > 0.55 (historically 36-43% WR)", now_cst().isoformat()))
+                        conn.commit()
+                        print(f"[FILTER] SOL wts={wts}: PASS — YES entry {entry:.3f} blocked (bias filter)")
                         return
 
                     # Risk check + variable stake
@@ -1306,30 +1473,42 @@ def decision_loop():
 
                     # ── Live order placement ─────────────────────────────────
                     try:
-                        coin_mode_row = conn2 = None
                         conn2 = db_connect()
                         global_live = conn2.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
                         coin_mode_row = conn2.execute("SELECT mode FROM coin_modes WHERE coin=?", (coin,)).fetchone()
+                        pool_row = conn2.execute("SELECT value FROM settings WHERE key='pool_mode'").fetchone()
                         conn2.close()
                         is_live = (global_live and global_live[0]) and (coin_mode_row and coin_mode_row[0] == "live")
+                        pool_on = pool_row and pool_row[0] == "1"
                         if is_live and ticker:
                             live_contracts = max(1, int(contracts))
-                            order_id, used_ticker, order_err = place_kalshi_order(coin, ticker, direction, live_contracts, entry)
-                            conn3 = db_connect()
-                            conn3.execute("""
-                                INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
-                                    limit_price, order_id, status, error, created_at)
-                                VALUES (?,?,?,?,?,?,?,?,?,?)
-                            """, (coin, wts, used_ticker, direction, live_contracts,
-                                  max(1, min(99, round(entry*100))),
-                                  order_id, "placed" if order_id else "failed",
-                                  order_err, now_cst().isoformat()))
-                            conn3.commit()
-                            conn3.close()
-                            if order_id:
-                                print(f"[LIVE] {coin} order placed: {order_id}  {direction} x{live_contracts} @ {entry:.3f}")
+                            if pool_on and pool_signals is not None:
+                                # Pool mode: register signal, winner picked after all threads done
+                                with pool_lock:
+                                    pool_signals[coin] = {
+                                        'direction': direction, 'entry': entry,
+                                        'confidence': confidence, 'contracts': live_contracts,
+                                        'ticker': ticker
+                                    }
+                                print(f"[POOL] {coin} signal registered: {direction}@{entry:.3f} conf={confidence:.2f}")
                             else:
-                                print(f"[LIVE] {coin} order FAILED: {order_err}")
+                                # Normal mode: place order immediately
+                                order_id, used_ticker, order_err = place_kalshi_order(coin, ticker, direction, live_contracts, entry)
+                                conn3 = db_connect()
+                                conn3.execute("""
+                                    INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
+                                        limit_price, order_id, status, error, created_at)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                                """, (coin, wts, used_ticker, direction, live_contracts,
+                                      max(1, min(99, round(entry*100))),
+                                      order_id, "placed" if order_id else "failed",
+                                      order_err, now_cst().isoformat()))
+                                conn3.commit()
+                                conn3.close()
+                                if order_id:
+                                    print(f"[LIVE] {coin} order placed: {order_id}  {direction} x{live_contracts} @ {entry:.3f}")
+                                else:
+                                    print(f"[LIVE] {coin} order FAILED: {order_err}")
                     except Exception as le:
                         print(f"[LIVE] {coin} order exception: {le}")
                 except Exception as e:
@@ -1340,23 +1519,84 @@ def decision_loop():
               except Exception as e:
                 print(f"[DECISION] {coin} outer: {e}")
 
-            threads = [threading.Thread(target=_decide_coin, args=(coin, wts, now), daemon=True) for coin in COINS]
+            # Pool mode: collect live signals, pick best one after all threads done
+            _pool_signals = {}  # coin -> {direction, entry, confidence, contracts, ticker}
+            _pool_lock = threading.Lock()
+
+            def _decide_coin_pooled(coin, wts, now):
+                _decide_coin(coin, wts, now, pool_signals=_pool_signals, pool_lock=_pool_lock)
+
+            threads = [threading.Thread(target=_decide_coin_pooled, args=(coin, wts, now), daemon=True) for coin in COINS]
             for t in threads: t.start()
             for t in threads: t.join(timeout=150)
+
+            # ── Pool mode: pick best live signal and place one order ──────────
+            try:
+                conn_pool = db_connect()
+                pool_enabled = conn_pool.execute(
+                    "SELECT value FROM settings WHERE key='pool_mode'"
+                ).fetchone()
+                global_live = conn_pool.execute(
+                    "SELECT global_live_enabled FROM system_state WHERE id=1"
+                ).fetchone()
+                conn_pool.close()
+                pool_on = pool_enabled and pool_enabled[0] == "1"
+                live_on = global_live and global_live[0]
+                if pool_on and live_on and _pool_signals and _pool_last_placed_wts < wts:
+                    # Get rolling win rate for tiebreak
+                    conn_pool2 = db_connect()
+                    def rolling_wr(coin):
+                        rows = conn_pool2.execute(
+                            "SELECT result FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS') ORDER BY window_ts DESC LIMIT 10",
+                            (coin,)
+                        ).fetchall()
+                        if len(rows) < 3: return 0.5
+                        return sum(1 for r in rows if r[0]=='WIN') / len(rows)
+                    # Score = confidence * 0.7 + rolling_wr * 0.3
+                    best_coin = max(_pool_signals, key=lambda c: _pool_signals[c]['confidence'] * 0.7 + rolling_wr(c) * 0.3)
+                    conn_pool2.close()
+                    sig = _pool_signals[best_coin]
+                    order_id, used_ticker, order_err = place_kalshi_order(
+                        best_coin, sig['ticker'], sig['direction'], sig['contracts'], sig['entry']
+                    )
+                    conn_pool3 = db_connect()
+                    conn_pool3.execute("""
+                        INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
+                            limit_price, order_id, status, error, created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """, (best_coin, wts, used_ticker, sig['direction'], sig['contracts'],
+                          max(1, min(99, round(sig['entry']*100))),
+                          order_id, "placed" if order_id else "failed",
+                          order_err, now_cst().isoformat()))
+                    conn_pool3.commit()
+                    conn_pool3.close()
+                    _pool_last_placed_wts = wts
+                    losers = [c for c in _pool_signals if c != best_coin]
+                    print(f"[POOL] Winner: {best_coin} {sig['direction']}@{sig['entry']:.3f} conf={sig['confidence']:.2f}  skipped: {losers}  order={'OK' if order_id else 'FAIL'}")
+            except Exception as pe:
+                print(f"[POOL] {pe}")
+            last_decided_wts = wts
             try:
                 resolve_trades()
             except Exception as e:
                 print(f"[RESOLVE] {e}")
+            try:
+                resolve_live_orders()
+            except Exception as e:
+                print(f"[LIVE RESOLVE] {e}")
         except Exception as e:
             print(f"[DECISION LOOP] {e}")
         time.sleep(30)
 
 # ── Betbot signals bridge ───────────────────────────────────────────────────────
 BETBOT_SIGNAL_FILES = {
-    "BTC": "/home/sean/autoresearch/data/kalshi_signals.json",
-    "ETH": "/home/sean/autoresearch/data/kalshi_signals_eth.json",
-    "SOL": "/home/sean/autoresearch/data/kalshi_signals_sol.json",
-    "XRP": "/home/sean/autoresearch/data/kalshi_signals_xrp.json",
+    "BTC":  "/home/sean/autoresearch/data/kalshi_signals.json",
+    "ETH":  "/home/sean/autoresearch/data/kalshi_signals_eth.json",
+    "SOL":  "/home/sean/autoresearch/data/kalshi_signals_sol.json",
+    "XRP":  "/home/sean/autoresearch/data/kalshi_signals_xrp.json",
+    "DOGE": "/home/sean/autoresearch/data/kalshi_signals_doge.json",
+    "BNB":  "/home/sean/autoresearch/data/kalshi_signals_bnb.json",
+    "HYPE": "/home/sean/autoresearch/data/kalshi_signals_hype.json",
 }
 _betbot_signals_cache: dict = {}
 
@@ -1391,7 +1631,7 @@ def get_engine_for_coin(coin):
     except Exception:
         return "minimax_llm"
 
-def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary):
+def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_volume=None, spread=None):
     if engine_key == "rules_engine":
         return rules_engine(coin, mkt)
     elif engine_key == "vector_knn":
@@ -1399,7 +1639,7 @@ def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary):
     elif engine_key == "hybrid":
         return hybrid_engine(coin, mkt, ticks)
     else:  # minimax_llm default
-        return minimax_analyze(coin, ticks_summary, coin_price)
+        return minimax_analyze(coin, ticks_summary, coin_price, market_volume=market_volume, spread=spread)
 
 def rules_engine(coin, mkt):
     try:
@@ -1449,14 +1689,16 @@ def vector_knn_engine(coin, mkt, ticks, k=10):
         query = [mid, spread, secs_left/900.0, tick_momentum,
                  yes_ask, yes_bid, (mid-0.5)**2, abs(tick_momentum)]
 
-        # Load historical windows that have known outcomes from decisions table
+        # Load historical windows with known outcomes from paper_trades
         conn = db_connect()
         hist = conn.execute("""
-            SELECT t.yes_bid, t.yes_ask, t.secs_left, d.direction, d.entry,
+            SELECT t.yes_bid, t.yes_ask, t.secs_left, pt.actual, d.entry,
                    t.coin_price, t.window_ts
             FROM kalshi_ticks t
             JOIN decisions d ON d.coin=t.coin AND d.window_ts=t.window_ts
-            WHERE t.coin=? AND d.direction IN ('YES','NO') AND d.outcome IS NOT NULL
+            JOIN paper_trades pt ON pt.coin=t.coin AND pt.window_ts=t.window_ts
+            WHERE t.coin=? AND d.direction IN ('YES','NO')
+              AND pt.result IN ('WIN','LOSS') AND pt.actual IN ('YES','NO')
             ORDER BY t.ts DESC LIMIT 2000
         """, (coin,)).fetchall()
         conn.close()
@@ -1757,26 +1999,28 @@ def prob_bar(yes_bid, yes_ask, poly_price=None):
   <div style="position:absolute;left:{bid_pct}%;width:{spread_w}%;height:100%;background:{spread_color};opacity:0.7;border-radius:3px"></div>
   <div style="position:absolute;left:{mid_pct}%;top:0;width:2px;height:100%;background:#fff;opacity:0.6"></div>
   {poly_marker}
-</div><div style="font-size:9px;color:#555;text-align:right;margin-top:1px">{mid_pct}%</div>'''
+</div><div style="font-size:10px;color:#8b949e;text-align:right;margin-top:1px">{mid_pct}%</div>'''
     except Exception:
         return ""
 
 TOOLTIP_CSS = """
-  .tt { color: #58a6ff; cursor: help; font-size: 11px; margin-left: 4px; user-select: none; position: relative; }
+  .tt { color: #58a6ff; cursor: help; font-size: 11px; margin-left: 4px; user-select: none; position: relative; display: inline-block; }
   .tt:hover::after {
     content: attr(data-tip);
-    position: fixed;
+    position: absolute;
+    left: 50%;
+    top: calc(100% + 4px);
+    transform: translateX(-50%);
     background: #1c2128;
     border: 1px solid #444;
     border-radius: 6px;
-    padding: 6px 10px;
+    padding: 8px 12px;
     font-size: 12px;
     color: #e6edf3;
-    max-width: 280px;
+    min-width: 200px;
+    max-width: 320px;
     white-space: normal;
     z-index: 9999;
-    transform: translateX(-50%);
-    margin-top: 4px;
     line-height: 1.5;
     box-shadow: 0 4px 12px rgba(0,0,0,0.5);
     pointer-events: none;
@@ -1789,7 +2033,7 @@ SHARED_CSS = """
   body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
   a { color: inherit; text-decoration: none; }
   .topbar { background: #161b22; border-bottom: 1px solid #30363d; padding: 0 20px; display: flex; align-items: center; height: 56px; gap: 0; position: sticky; top: 0; z-index: 100; }
-  .logo-img { height: 34px; width: 34px; border-radius: 6px; object-fit: cover; margin-right: 10px; }
+  .logo-img { height: 44px; width: 44px; border-radius: 8px; object-fit: cover; margin-right: 12px; }
   .logo-text { font-size: 18px; font-weight: 800; color: #58a6ff; letter-spacing: 2px; margin-right: 20px; white-space: nowrap; }
   .nav { display: flex; gap: 2px; flex: 1; overflow-x: auto; }
   .nav a { padding: 8px 12px; border-radius: 6px; font-size: 13px; font-weight: 500; color: #8b949e; transition: background 0.15s, color 0.15s; white-space: nowrap; }
@@ -1797,7 +2041,7 @@ SHARED_CSS = """
   .nav a.active { background: #21262d; color: #58a6ff; }
   .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: #8b949e; white-space: nowrap; }
   .content { padding: 20px; max-width: 1600px; margin: 0 auto; }
-  .row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }
+  .row { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; margin-bottom: 20px; }
   .row > * { min-width: 0; }
   @media (max-width: 500px)  { .row { grid-template-columns: repeat(2, 1fr); } }
   .card { background: #161b22; border: 1px solid #30363d; border-radius: 10px; padding: 16px; position: relative; }
@@ -1814,8 +2058,8 @@ SHARED_CSS = """
   .trade-table th { text-align: left; padding: 7px 10px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
   .trade-table td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
   .data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  .data-table th { text-align: left; padding: 8px 16px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
-  .data-table td { padding: 7px 16px; border-bottom: 1px solid #21262d; white-space: nowrap; }
+  .data-table th { text-align: left; padding: 10px 24px; color: #8b949e; border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+  .data-table td { padding: 10px 24px; border-bottom: 1px solid #21262d; white-space: nowrap; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
   .badge-win  { background: #1a2f1a; color: #3fb950; border: 1px solid #238636; }
   .badge-loss { background: #2d1515; color: #f85149; border: 1px solid #da3633; }
@@ -1922,6 +2166,22 @@ def page_shell(title, active_nav, body, extra_js="", user=None):
 {kill_banner}
 {body}
 </div>
+
+<!-- Full-text popup modal -->
+<div id="detail-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:10000;align-items:center;justify-content:center">
+  <div style="background:#161b22;border:1px solid #444;border-radius:10px;padding:24px;max-width:560px;width:90%;max-height:80vh;overflow-y:auto;position:relative">
+    <button onclick="document.getElementById('detail-modal').style.display='none'" style="position:absolute;top:10px;right:12px;background:none;border:none;color:#8b949e;font-size:18px;cursor:pointer">&#x2715;</button>
+    <div id="detail-modal-body" style="font-size:13px;line-height:1.7;color:#e6edf3;white-space:pre-wrap;padding-right:16px"></div>
+  </div>
+</div>
+<script>
+function showDetail(text) {{
+  document.getElementById('detail-modal-body').textContent = text;
+  document.getElementById('detail-modal').style.display = 'flex';
+}}
+document.addEventListener('keydown', function(e){{ if(e.key==='Escape') document.getElementById('detail-modal').style.display='none'; }});
+document.getElementById('detail-modal').addEventListener('click', function(e){{ if(e.target===this) this.style.display='none'; }});
+</script>
 
 <!-- Chat popup -->
 <button id="chat-btn" onclick="toggleChat()" title="Ask Autobet">💬</button>
@@ -2156,6 +2416,11 @@ def build_dashboard(user=None):
     # Live toggle state
     state = conn.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
     live_on = state and state[0] == 1
+    # Pool mode
+    pool_row = conn.execute("SELECT value FROM settings WHERE key='pool_mode'").fetchone()
+    pool_on = pool_row and pool_row[0] == "1"
+    pool_bal_row = conn.execute("SELECT value FROM settings WHERE key='pool_balance'").fetchone()
+    pool_balance = float(pool_bal_row[0]) if pool_bal_row and pool_bal_row[0] else None
     # Per-coin live mode and last live order
     coin_modes_db = {r[0]: r[1] for r in conn.execute("SELECT coin, mode FROM coin_modes").fetchall()}
     coin_last_order = {}
@@ -2166,6 +2431,14 @@ def build_dashboard(user=None):
             (coin, recent_cutoff)
         ).fetchone()
         coin_last_order[coin] = row
+    # Pool: last winner this session
+    pool_last = conn.execute(
+        "SELECT coin, direction, contracts, status, window_ts FROM live_orders ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    pool_recent_orders = conn.execute(
+        "SELECT coin, direction, contracts, status, window_ts, limit_price FROM live_orders WHERE window_ts >= ? ORDER BY id DESC LIMIT 10",
+        (int(time.time()) - 7200,)
+    ).fetchall()
     conn.close()
 
     with _state_lock:
@@ -2251,10 +2524,10 @@ def build_dashboard(user=None):
   <div class="card-header">
     <div class="coin-badge" style="background:{color}">{letter}</div>
     <div><div class="coin-name">{coin}</div><div class="mkt-ticker" style="font-size:10px">{ticker}</div></div>
-    <div style="margin-left:auto;text-align:right"><div class="price" style="font-size:15px;color:{'#3fb950' if total_pnl>=0 else '#f85149'}">${capital:.2f}</div><div style="font-size:10px;color:#8b949e">{price_str}</div></div>
+    <div style="margin-left:auto;text-align:right"><div class="price" style="font-size:15px;color:{'#3fb950' if total_pnl>=0 else '#f85149'}">${(pool_balance if (pool_on and coin_is_live and pool_balance is not None) else capital):.2f}</div><div style="font-size:10px;color:#8b949e">{'pool' if (pool_on and coin_is_live and pool_balance is not None) else price_str}</div></div>
   </div>
   <div class="stat-row"><span class="stat-label">Kalshi Bid/Ask</span><span class="stat-value">{yes_bid:.3f} / {yes_ask:.3f}</span></div>
-  <div style="margin:4px 0 2px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:9px;color:#555;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
+  <div style="margin:4px 0 2px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:10px;color:#8b949e;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
   {ev_html}
   <div class="stat-row"><span class="stat-label">P&amp;L / Rate</span><span class="stat-value"><span class="{pnl_cls}">${total_pnl:+.2f}</span> &nbsp; {win_rate}</span></div>
   <div class="stat-row" style="font-size:10px"><span class="stat-label" style="color:#555">ex-outlier P&amp;L {tooltip_html("ex_outlier")}</span><span class="stat-value" style="font-size:10px"><span class="{'green' if (coin_ex_outlier.get(coin,(0,0,0))[1])>=0 else 'red'}">${coin_ex_outlier.get(coin,(0,0,0))[1]:+.2f}</span></span></div>
@@ -2262,7 +2535,52 @@ def build_dashboard(user=None):
   {live_indicator}
 </div>
 """
-    body += '</div>\n<div class="section-title">Recent Trades</div>\n'
+    body += '</div>\n'
+
+    # ── Pool mode balance card ────────────────────────────────────────────────────
+    if pool_on and live_on:
+        live_coins_pool = [c for c in COINS if coin_modes_db.get(c) == "live"]
+        bal_s = f"${pool_balance:,.2f}" if pool_balance is not None else "syncing…"
+        coins_s = " · ".join(f'<span style="color:{COIN_COLORS[c]};font-weight:700">{c}</span>' for c in live_coins_pool) or "none"
+        orders_html = ""
+        if pool_recent_orders:
+            orders_html = '<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px">'
+            for oc, od, ocontracts, ostatus, owts, olimit_price in pool_recent_orders:
+                sc = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e", "executed": "#3fb950"}.get(ostatus, "#8b949e")
+                proj = ""
+                try:
+                    if olimit_price and ocontracts:
+                        ep = float(olimit_price) / 100.0
+                        gross = ocontracts * (1.0 - ep)
+                        fee = min(KALSHI_FEE_RATE * ep * (1.0 - ep), 0.02) * ocontracts
+                        net = gross - fee
+                        proj = f' <span style="color:#3fb950;font-weight:700">+${net:.2f}</span>'
+                except Exception:
+                    pass
+                orders_html += f'<span style="background:#0d1117;border:1px solid {sc};border-radius:6px;padding:3px 8px;font-size:12px">'
+                orders_html += f'<span style="color:{COIN_COLORS.get(oc,"#ccc")};font-weight:700">{oc}</span> '
+                orders_html += f'<span style="color:#e6edf3">{od}</span> '
+                orders_html += f'<span style="color:#8b949e">{ocontracts}c</span>'
+                orders_html += proj
+                orders_html += '</span>'
+            orders_html += '</div>'
+        body += f'''<div class="card" style="margin-bottom:16px;border-color:#1f6feb">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+    <div style="width:44px;height:44px;border-radius:8px;background:#1f6feb;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;color:#fff">P</div>
+    <div>
+      <div style="font-size:11px;color:#8b949e;font-weight:600;text-transform:uppercase;letter-spacing:1px">Pool Mode</div>
+      <div style="font-size:22px;font-weight:800;color:#e6edf3">{bal_s}</div>
+    </div>
+    <div style="margin-left:auto;text-align:right">
+      <div style="font-size:11px;color:#8b949e">competing coins</div>
+      <div style="font-size:13px;margin-top:2px">{coins_s}</div>
+    </div>
+  </div>
+  <div style="font-size:11px;color:#8b949e">One live trade per window · winner picked by confidence + win rate</div>
+  {orders_html}
+</div>\n'''
+
+    body += '<div class="section-title">Recent Trades</div>\n'
     for coin in COINS:
         trades = recent_trades.get(coin, [])
         color  = COIN_COLORS[coin]
@@ -2415,7 +2733,9 @@ def build_decisions_page(user=None):
             body += f'<td>{action}</td><td>{entry_s}</td><td>{conf_s}</td><td>{size_s}</td>'
             body += f'<td style="font-size:11px">{oc_str}</td><td>{outcome}</td>'
             body += f'<td class="{pnl_cls}">{pnl_s}</td>'
-            body += f'<td class="muted" style="font-size:11px" title="{rat_full.replace(chr(34), chr(39))}">{rat_short}</td></tr>\n'
+            rat_esc = rat_full.replace("\\", "\\\\").replace("'", "\\'")
+            clickable = f' onclick="showDetail(\'{rat_esc}\')" style="cursor:pointer"' if len(rat_full) > 70 else ''
+            body += f'<td class="muted" style="font-size:11px"{clickable}>{rat_short}</td></tr>\n'
         body += '</table>\n</div>\n'
     return page_shell("Decisions", "/decisions", body, user=user)
 
@@ -2437,11 +2757,13 @@ def build_markets_page(user=None, msg=""):
     body += '<div class="page-sub">Market group configuration, execution mode, and live venue data.</div>\n'
     body += msg_html
 
-    # Global live toggle
+    # Global live toggle + pool mode
     conn2 = db_connect()
     state = conn2.execute("SELECT global_live_enabled FROM system_state WHERE id=1").fetchone()
+    pool_row = conn2.execute("SELECT value FROM settings WHERE key='pool_mode'").fetchone()
     conn2.close()
     live_on = state and state[0] == 1
+    pool_on = pool_row and pool_row[0] == "1"
     live_badge = '<span class="badge badge-ok">ON</span>' if live_on else '<span class="badge badge-err">OFF</span>'
     live_action = "disable" if live_on else "enable"
     live_label  = "Disable Live" if live_on else "Enable Live"
@@ -2452,6 +2774,15 @@ def build_markets_page(user=None, msg=""):
     <span class="stat-value">{live_badge}
       <form method="POST" action="/markets/live-toggle" style="display:inline;margin-left:12px">
         <button class="btn {live_cls}" type="submit" onclick="return confirm('Toggle global live trading?')">{live_label}</button>
+      </form>
+    </span>
+  </div>
+  <div class="stat-row" style="margin-top:10px">
+    <span class="stat-label"><strong>Pool Mode</strong> <span style="font-size:11px;color:#8b949e">— one trade per window, best live signal wins</span></span>
+    <span class="stat-value">
+      {'<span class="badge badge-ok">ON</span>' if pool_on else '<span class="badge badge-pass">OFF</span>'}
+      <form method="POST" action="/markets/pool-toggle" style="display:inline;margin-left:12px">
+        <button class="btn" type="submit">{'Disable Pool Mode' if pool_on else 'Enable Pool Mode'}</button>
       </form>
     </span>
   </div>
@@ -2694,6 +3025,7 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Max Drawdown (%) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_drawdown_pct" value="{rs['max_drawdown_pct']*100:.0f}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Max Stake ($) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_stake" value="{rs['max_stake']:.0f}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Cooldown After N Losses {tooltip_html("cooldown_after_losses")}</span><input type="number" name="cooldown_after_losses" value="{rs['cooldown_after_losses']}" step="1" min="0" style="width:100px"></div>
+<div class="form-row"><span class="form-label">Min Volume (contracts) {tooltip_html("min_volume")}</span><input type="number" name="min_volume" value="{settings.get('min_volume', 500)}" step="50" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Skip windows below this 24h volume. 0 = disabled.</span></div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Risk Settings</button></div>
 </form>'''
     body += '</div>\n'
@@ -2898,7 +3230,7 @@ def build_fill_quality_page(user=None):
     conn = db_connect()
 
     liq_rows = conn.execute(
-        "SELECT coin, window_ts, direction, entry, requested_contracts, available_contracts, filled_contracts, liquidity_ok, created_at "
+        "SELECT coin, window_ts, ticker, direction, entry, requested_contracts, available_contracts, filled_contracts, liquidity_ok, created_at "
         "FROM fill_quality ORDER BY id DESC LIMIT 50"
     ).fetchall()
     import time as _time
@@ -2928,23 +3260,23 @@ def build_fill_quality_page(user=None):
             dir_color  = "#3fb950" if direction == "YES" else "#f85149"
             sc = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e"}.get(status, "#8b949e")
             icon = {"filled": "✓", "placed": "⏳", "failed": "✗", "canceled": "–"}.get(status, "?")
-            oid_short  = (order_id or "")[:12] + "…" if order_id else "—"
+            oid_short  = (order_id or "")[:14] + "…" if order_id and len(order_id) > 14 else (order_id or "—")
             filled_s   = f"{filled}c" if filled is not None else "—"
             avg_s      = f"{avg_price*100:.0f}¢" if avg_price else f"{limit_price}¢ limit"
             err_s      = ""
             if status == "failed" and error:
-                # strip boilerplate, show just the meaningful part
                 clean = error.replace('HTTP 401: {"error":{"code":"authentication_error","message":"authentication_error","details":"', "").rstrip('"} ')
                 clean = clean.replace('HTTP 404: {"error":{"code":"market_not_found","message":"market not found","service":"exchange"}', "market not found")
                 err_s = f'<div style="font-size:10px;color:#f85149;margin-top:2px">{clean[:80]}</div>'
-            body += f'''<div style="padding:10px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:12px">
-  <div style="width:72px;font-size:11px;color:#8b949e">{ts}</div>
-  <div style="width:32px;font-size:12px;font-weight:700;color:{COIN_COLORS.get(coin,"#ccc")}">{coin}</div>
-  <div style="width:28px;font-size:11px;font-weight:600;color:{dir_color}">{direction}</div>
-  <div style="width:36px;font-size:11px;color:#ccc">{contracts}c</div>
-  <div style="width:40px;font-size:11px;color:#8b949e">{avg_s}</div>
+            body += f'''<div style="padding:10px 16px;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:24px">
+  <div style="width:80px;font-size:11px;color:#8b949e">{ts}</div>
+  <div style="width:40px;font-size:12px;font-weight:700;color:{COIN_COLORS.get(coin,"#ccc")}">{coin}</div>
+  <div style="width:36px;font-size:11px;font-weight:600;color:{dir_color}">{direction}</div>
+  <div style="width:48px;font-size:11px;color:#ccc">{contracts}c</div>
+  <div style="width:56px;font-size:11px;color:#8b949e">{avg_s}</div>
+  <div style="width:40px;font-size:11px;color:#8b949e">{filled_s}</div>
   <div style="flex:1;font-size:10px;color:#555;font-family:monospace">{oid_short}</div>
-  <div style="width:60px;text-align:right"><span style="font-size:11px;font-weight:600;color:{sc}">{icon} {status}</span>{err_s}</div>
+  <div style="width:80px;text-align:right"><span style="font-size:11px;font-weight:600;color:{sc}">{icon} {status}</span>{err_s}</div>
 </div>'''
         body += '</div>\n'
 
@@ -2955,25 +3287,26 @@ def build_fill_quality_page(user=None):
     else:
         body += '<div class="card" style="overflow-x:auto">\n'
         body += '<table class="data-table">\n'
-        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Requested</th><th>Available</th><th>Status</th></tr>\n'
+        body += '<tr><th>Time</th><th>Coin</th><th>Dir</th><th>Entry</th><th>Requested</th><th>Available</th><th>Filled</th><th>Status</th></tr>\n'
         for r in liq_rows:
-            coin, wts, direction, entry, req, avail, filled, liq_ok, created_at = r
+            coin, wts, ticker, direction, entry, req, avail, filled, liq_ok, created_at = r
             try:
                 ts = _dt.datetime.fromtimestamp(wts).strftime("%m/%d %H:%M")
             except:
                 ts = str(wts)
             dir_color = "#3fb950" if direction == "YES" else "#f85149"
+            req_s    = f"{req:.1f}" if req is not None else "—"
+            avail_s  = f"{avail:.1f}" if avail is not None else "—"
+            filled_s = f"{filled:.1f}" if filled is not None else "—"
             if liq_ok == 1:
-                status = '<span style="color:#3fb950">✓ OK</span>'
-            elif avail is not None and avail < 10:
-                status = '<span style="color:#f85149">✗ thin</span>'
+                status_s = '<span style="color:#3fb950">✓ OK</span>'
+            elif liq_ok == 0 and avail is not None and avail < 10:
+                status_s = '<span style="color:#f85149">✗ SKIP (thin)</span>'
             else:
-                status = '<span style="color:#e3b341">~ partial</span>'
-            req_s   = f"{req:.1f}" if req is not None else "—"
-            avail_s = f"{avail:,.0f}" if avail is not None else "—"
-            body += f'<tr><td>{ts}</td><td style="color:{COIN_COLORS.get(coin,"#ccc")};font-weight:700">{coin}</td>'
+                status_s = '<span style="color:#e3b341">~ PARTIAL</span>'
+            body += f'<tr><td>{ts}</td><td style="font-weight:700;color:{COIN_COLORS.get(coin,"#ccc")}">{coin}</td>'
             body += f'<td style="color:{dir_color};font-weight:600">{direction}</td>'
-            body += f'<td>{entry:.3f}</td><td>{req_s}</td><td>{avail_s}</td><td>{status}</td></tr>\n'
+            body += f'<td>{entry:.4f}</td><td>{req_s}</td><td>{avail_s}</td><td>{filled_s}</td><td>{status_s}</td></tr>\n'
         body += '</table>\n</div>\n'
 
     return page_shell("Fill Quality", "/fill-quality", body, user=user)
@@ -3041,19 +3374,28 @@ def build_engines_page(user=None, msg=""):
     if msg:
         body += f'<div class="alert alert-ok">{msg}</div>\n'
     engines = [
-        ("minimax_llm",   "MiniMax LLM",         "Calls MiniMax API each window. Best quality, uses tokens."),
-        ("rules_engine",  "Rules Engine",         "Pure rules: mid>0.62=YES, mid<0.38=NO. Fast, no API."),
-        ("vector_knn",    "Vector KNN",           "8-feature cosine similarity vs historical windows. Needs 20+ outcomes."),
-        ("hybrid",        "Hybrid (Rules+KNN)",   "Rules gate then KNN confidence boost. Best of both."),
-        ("betbot_signal", "Betbot Signal (auto)", "Reads evolved strategy signal files from autoresearch loop."),
+        ("minimax_llm",   "MiniMax LLM",
+         "Sends the Kalshi order book snapshot, current coin price, and recent tick history to MiniMax M2.5 via API. Returns a direction (YES/NO) and entry price. Highest signal quality — responds to real market context each window. Costs ~$0.001/call and takes 2–5 seconds. Best choice when API is reliable."),
+        ("rules_engine",  "Rules Engine",
+         "Simple threshold logic: if Kalshi YES mid > 0.62, bet YES. If mid < 0.38, bet NO. Otherwise PASS. Zero latency, no API calls, always available. Good baseline to compare against smarter engines. Ignores price momentum and order book depth."),
+        ("vector_knn",    "Vector KNN",
+         "Finds the 10 most similar historical 15-min windows using 8-feature cosine similarity (yes_bid, yes_ask, spread, volume, price change, momentum, etc.) and votes on direction. No API calls. Gets smarter as trade history grows — needs at least 20 resolved outcomes to be useful."),
+        ("hybrid",        "Hybrid (Rules+KNN)",
+         "Two-signal gate: Rules Engine must agree with KNN before a trade fires. Both have to point the same direction. More conservative than either alone — fires less often but with higher combined confidence. Good for reducing noise when KNN history is thin."),
+        ("betbot_signal", "Betbot Signal",
+         "Reads signal files that betbot's autoresearch loop writes to ~/autoresearch/data/kalshi_signals*.json. The loop uses MiniMax M2.7 to rewrite and score the kalshi_analyze.py strategy script every few windows based on live P&L. Most sophisticated option — the strategy self-improves over time. Requires betbot running on ryz.local."),
     ]
+    # Build JS map of engine descriptions
+    import json as _json
+    engine_desc_js = _json.dumps({ek: d for ek,_,d in engines})
+    body += f'<script>var ENGINE_DESCS={engine_desc_js};function updDesc(coin,sel){{var d=document.getElementById("desc_"+coin);if(d)d.textContent=ENGINE_DESCS[sel.value]||"";}}</script>\n'
     body += '<form method="POST" action="/engines/save">\n'
     body += '<div class="card">\n'
     body += '<table class="trade-table"><tr><th>Coin</th><th>Engine</th><th>Description</th></tr>\n'
     for coin in COINS:
         current = assignments.get(coin, "minimax_llm")
         body += f'<tr><td style="font-weight:700;color:{COIN_COLORS[coin]}">{coin}</td><td>'
-        body += f'<select name="engine_{coin}" style="width:180px">'
+        body += f'<select name="engine_{coin}" style="width:180px" onchange="updDesc(\'{coin}\',this)">'
         for ek, elabel, _ in engines:
             sel = ' selected' if ek == current else ''
             body += f'<option value="{ek}"{sel}>{elabel}</option>'
@@ -3062,6 +3404,15 @@ def build_engines_page(user=None, msg=""):
         body += f'<span id="desc_{coin}">{desc}</span></td></tr>\n'
     body += '</table>\n</div>\n'
     body += '<button type="submit" class="btn" style="margin-top:12px">Save Engine Assignments</button>\n</form>\n'
+
+    # Engine reference card
+    body += '<div class="section-title" style="margin-top:20px">Engine Reference</div>\n<div class="card">\n'
+    for ek, elabel, desc in engines:
+        body += f'<div style="padding:10px 0;border-bottom:1px solid #21262d">'
+        body += f'<div style="font-size:13px;font-weight:600;color:#e6edf3;margin-bottom:3px"><code style="color:#58a6ff">{ek}</code> &mdash; {elabel}</div>'
+        body += f'<div style="font-size:12px;color:#8b949e;line-height:1.5">{desc}</div>'
+        body += f'</div>\n'
+    body += '</div>\n'
 
     # Engine status table
     body += '<div class="section-title" style="margin-top:20px">Engine Status</div>\n<div class="card">\n'
@@ -3228,7 +3579,7 @@ Entry floor: {ENTRY_FLOOR} | Entry ceiling: {ENTRY_CEILING} | Max contracts: {MA
 
 === RISK GUARDRAILS ===
 - Entry floor {ENTRY_FLOOR}: entries below this are blocked — they produce unrealistic contract counts (e.g. 38,000 contracts at $0.001) that can never fill at real Kalshi order book depth.
-- Entry ceiling {ENTRY_CEILING}: entries above this are blocked — confirmed negative EV across all 4 coins (42% win rate, -$1,673 total in backtests).
+- Entry ceiling {ENTRY_CEILING}: entries above this are blocked — confirmed negative EV across all coins (entry 0.8+ = -$1,886 net in live data; momentum-chasing at near-certainty prices reverses at expiry).
 - Max contracts {MAX_CONTRACTS}: cap on contracts per trade to reflect realistic order book liquidity.
 - Fallback disabled: when the decision engine returns no signal, the system now records a PASS instead of blindly following market price. Fallback had 36-48% win rate across all coins.
 - Ex-outlier P&L: shown on each coin card — total P&L minus the top 3 biggest wins. This strips lucky tail events to show underlying strategy performance. If negative, the strategy loses money without lucky strikes.
@@ -3549,11 +3900,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mdd = float(params.get("max_drawdown_pct", 30)) / 100.0
             ms  = float(params.get("max_stake", 30))
             cal = int(params.get("cooldown_after_losses", 3))
+            mv  = float(params.get("min_volume", 500))
             conn.execute("""
                 UPDATE risk_settings SET kill_switch=?, daily_loss_limit=?, max_drawdown_pct=?,
                 max_stake=?, cooldown_after_losses=?, updated_at=? WHERE id=1
             """, (ks, dll, mdd, ms, cal, now_cst().isoformat()))
-
+            conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('min_volume',?,?)",
+                         (str(mv), now_cst().isoformat()))
             conn.commit()
             conn.close()
             audit("risk_settings_saved", "risk_settings", payload={"kill_switch": ks, "daily_loss_limit": dll},
@@ -3573,6 +3926,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn.close()
                 audit("account_reset", "paper_accounts", coin, actor=user["username"] if user else "system")
             self.redirect("/settings?reset=1")
+
+        elif path == "/markets/pool-toggle":
+            conn = db_connect()
+            row = conn.execute("SELECT value FROM settings WHERE key='pool_mode'").fetchone()
+            new_val = "0" if (row and row[0] == "1") else "1"
+            conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('pool_mode',?,?)",
+                         (new_val, now_cst().isoformat()))
+            conn.commit()
+            conn.close()
+            audit("pool_mode_toggle", "settings", payload={"pool_mode": new_val},
+                  actor=user["username"] if user else "system")
+            self.redirect("/markets")
 
         elif path == "/markets/live-toggle":
             conn = db_connect()
@@ -3594,6 +3959,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 conn = db_connect()
                 conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                              (f"mode_{coin}", mode, now_cst().isoformat()))
+                conn.execute("INSERT OR REPLACE INTO coin_modes (coin, mode, updated_at) VALUES (?,?,?)",
+                             (coin, mode, now_cst().isoformat()))
 
                 conn.commit()
                 conn.close()
@@ -3937,7 +4304,10 @@ def build_coin_page(coin, user=None):
             row_style = ' style="opacity:0.5"' if is_fallback else ""
             fallback_tag = ' <span style="font-size:9px;color:#f85149;font-weight:700">FALLBACK</span>' if is_fallback else ""
             body += f'<tr{row_style}><td>{t_s}</td><td>{direction}{fallback_tag}</td><td>{entry:.3f}</td><td>{conf_s}</td>'
-            body += f'<td class="muted" style="font-size:11px">{rat[:60]}</td>'
+            rat_short2 = rat[:60] + ("…" if len(rat) > 60 else "")
+            rat_esc2 = rat.replace("\\", "\\\\").replace("'", "\\'")
+            click2 = f' onclick="showDetail(\'{rat_esc2}\')" style="cursor:pointer"' if len(rat) > 60 else ''
+            body += f'<td class="muted" style="font-size:11px"{click2}>{rat_short2}</td>'
             body += f'<td><span class="badge {bc}">{res_s}</span></td><td class="{pnl_c2}">{pnl_s}</td></tr>\n'
         body += '</table>\n'
     body += '</div>\n'
