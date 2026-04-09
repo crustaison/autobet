@@ -300,7 +300,7 @@ def check_exit_positions():
 
         # Get filled live orders for current window not yet exited
         positions = conn.execute("""
-            SELECT id, coin, ticker, direction, filled_contracts, avg_fill_price
+            SELECT id, coin, ticker, direction, filled_contracts, avg_fill_price, order_id
             FROM live_orders
             WHERE window_ts = ? AND status IN ('filled','executed','filled_partial')
               AND filled_contracts > 0 AND avg_fill_price > 0
@@ -315,7 +315,7 @@ def check_exit_positions():
             mkts = {k: dict(v) for k, v in _active_mkts.items()}
 
         for pos in positions:
-            lo_id, coin, ticker, direction, n_filled, avg_price = pos
+            lo_id, coin, ticker, direction, n_filled, avg_price, entry_order_id = pos
             n = int(n_filled)
             avg_p = float(avg_price)
             mkt = mkts.get(coin, {})
@@ -380,7 +380,21 @@ def check_exit_positions():
             if reason:
                 # Place sell order
                 order_id, err = sell_kalshi_position(ticker, direction, n, cur_bid)
-                exit_pnl = round(n * (cur_bid - avg_p), 4)
+                # P&L = sell proceeds - entry cost - entry fees - exit fees
+                gross_exit = n * (cur_bid - avg_p)
+                entry_fees = 0.0
+                exit_fees = 0.0
+                if entry_order_id:
+                    ord_resp = kalshi_get(f"/portfolio/orders/{entry_order_id}")
+                    if ord_resp:
+                        o = ord_resp.get("order", {})
+                        entry_fees = float(o.get("maker_fees_dollars") or 0) + float(o.get("taker_fees_dollars") or 0)
+                if order_id:
+                    exit_ord_resp = kalshi_get(f"/portfolio/orders/{order_id}")
+                    if exit_ord_resp:
+                        eo = exit_ord_resp.get("order", {})
+                        exit_fees = float(eo.get("maker_fees_dollars") or 0) + float(eo.get("taker_fees_dollars") or 0)
+                exit_pnl = round(gross_exit - entry_fees - exit_fees, 4)
                 conn2 = db_connect()
                 if order_id:
                     conn2.execute("""
@@ -1877,7 +1891,7 @@ def resolve_live_orders():
     now = int(time.time())
     conn = db_connect()
     orders = conn.execute("""
-        SELECT id, coin, window_ts, ticker, direction, filled_contracts, avg_fill_price
+        SELECT id, coin, window_ts, ticker, direction, filled_contracts, avg_fill_price, order_id
         FROM live_orders
         WHERE status IN ('filled', 'filled_partial', 'executed')
           AND resolved_at IS NULL
@@ -1886,7 +1900,7 @@ def resolve_live_orders():
     conn.close()
 
     for row in orders:
-        lo_id, coin, wts, ticker, direction, filled_count, avg_price = row
+        lo_id, coin, wts, ticker, direction, filled_count, avg_price, order_id = row
         if not ticker or not filled_count or not avg_price:
             continue
         filled_count = int(filled_count)
@@ -1905,13 +1919,27 @@ def resolve_live_orders():
         actual_direction = "YES" if kalshi_result == "yes" else "NO"
         won = (direction == actual_direction)
 
+        # Prefer actual fees from Kalshi order; fall back to estimated formula
+        actual_fee = None
+        if order_id:
+            ord_resp = kalshi_get(f"/portfolio/orders/{order_id}")
+            if ord_resp:
+                o = ord_resp.get("order", {})
+                maker_fee = float(o.get("maker_fees_dollars") or 0)
+                taker_fee = float(o.get("taker_fees_dollars") or 0)
+                actual_fee = maker_fee + taker_fee
+
         if won:
             gross = filled_count * (1.0 - avg_price)
-            fee_per = min(KALSHI_FEE_RATE * avg_price * (1.0 - avg_price), 0.02)
-            fee = filled_count * fee_per
+            if actual_fee is not None:
+                fee = actual_fee
+            else:
+                fee_per = min(KALSHI_FEE_RATE * avg_price * (1.0 - avg_price), 0.02)
+                fee = filled_count * fee_per
             pnl = round(gross - fee, 4)
         else:
-            pnl = round(-(filled_count * avg_price), 4)
+            fee = actual_fee if actual_fee is not None else 0.0
+            pnl = round(-(filled_count * avg_price) - fee, 4)
 
         conn2 = db_connect()
         conn2.execute("""
@@ -3454,17 +3482,19 @@ def build_dashboard(user=None):
               SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END),
               COALESCE(SUM(pnl), 0)
             FROM live_orders
-            WHERE coin=? AND status IN ('filled','executed','filled_partial','exited')
+            WHERE coin=? AND order_id IS NOT NULL
+              AND status IN ('filled','executed','filled_partial','exited')
               AND resolved_at IS NOT NULL
         """, (coin,)).fetchone()
         if r and (r[0] or r[1]):
             live_wl[coin] = (int(r[0] or 0), int(r[1] or 0), float(r[2] or 0))
     # Recent live order history per coin (activity log style, last 5)
+    # Only include real Kalshi orders (order_id IS NOT NULL), skip failed/cancelled
     coin_live_history = {}
     for coin in COINS:
         rows = conn.execute("""
-            SELECT direction, contracts, avg_fill_price, status, pnl, window_ts
-            FROM live_orders WHERE coin=?
+            SELECT direction, contracts, avg_fill_price, status, pnl, window_ts, actual_direction
+            FROM live_orders WHERE coin=? AND order_id IS NOT NULL
             ORDER BY id DESC LIMIT 5
         """, (coin,)).fetchall()
         coin_live_history[coin] = rows
@@ -3584,7 +3614,7 @@ def build_dashboard(user=None):
 </div>'''
             # Activity log rows
             rows_html = ""
-            for h_dir, h_contracts, h_avg_price, h_status, h_pnl, h_wts in hist:
+            for h_dir, h_contracts, h_avg_price, h_status, h_pnl, h_wts, h_actual_dir in hist:
                 h_time_s = ts_cst(h_wts).strftime("%H:%M") if h_wts else "—"
                 if h_status == "canceled":
                     row_color = "#8b949e"
@@ -3605,10 +3635,15 @@ def build_dashboard(user=None):
                     result_s  = h_status
                     pnl_s     = ""
                 entry_disp = f"{float(h_avg_price)*100:.0f}¢" if h_avg_price else "—"
+                # Show Kalshi-settled direction if different from our bet (confirms source of truth)
+                settled_tag = ""
+                if h_actual_dir and h_status in ("filled", "executed", "filled_partial"):
+                    settled_tag = f'<span style="font-size:9px;color:#8b949e;flex-shrink:0">→{h_actual_dir}</span>'
                 rows_html += f'<div style="display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px solid #21262d;min-width:0">' \
                              f'<span style="font-size:9px;color:#6e7681;min-width:30px;flex-shrink:0">{h_time_s}</span>' \
                              f'<span style="font-size:10px;color:#e6edf3;font-weight:600;min-width:22px;flex-shrink:0">{h_dir}</span>' \
                              f'<span style="font-size:10px;color:#8b949e;flex-shrink:0">{h_contracts}c @ {entry_disp}</span>' \
+                             f'{settled_tag}' \
                              f'<span style="font-size:10px;color:{row_color};margin-left:4px;flex-shrink:0">{result_s}</span>' \
                              f'{pnl_s}</div>'
             if rows_html or active_html:
@@ -4284,6 +4319,17 @@ def _blackout_hour_grid(hour_wr, blackout_str):
                      f'</div>')
     return f'<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px">{"".join(cells)}</div>'
 
+def _coin_blackout_row(coin, hour_wr, settings):
+    color = COIN_COLORS.get(coin, "#ccc")
+    key = f"blackout_hours_{coin}"
+    val = settings.get(key, "")
+    grid = _blackout_hour_grid(hour_wr, val)
+    return (f'<div style="margin-bottom:10px">'
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">'
+            f'<span style="font-size:11px;font-weight:700;color:{color};min-width:36px">{coin}</span>'
+            f'<input type="text" name="{key}" value="{val}" style="width:160px;font-size:11px" placeholder="e.g. 3,6,11">'
+            f'</div>{grid}</div>')
+
 def build_settings_page(user=None, msg=""):
     conn = db_connect()
     settings = dict(conn.execute("SELECT key, value FROM settings").fetchall())
@@ -4351,13 +4397,7 @@ def build_settings_page(user=None, msg=""):
       </label>
     </div>
     <div style="font-size:10px;color:#8b949e;margin-bottom:10px">Blocks hours with WR &lt;{BLACKOUT_BLOCK_WR:.0%}, unblocks WR ≥{BLACKOUT_UNBLOCK_WR:.0%} (min {BLACKOUT_MIN_TRADES} trades). Red border = blocked. Recalculates every 2h.</div>
-    {''.join(f"""<div style="margin-bottom:10px">
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-        <span style="font-size:11px;font-weight:700;color:{COIN_COLORS.get(c,'#ccc')};min-width:36px">{c}</span>
-        <input type="text" name="blackout_hours_{c}" value="{settings.get(f'blackout_hours_{c}','')}" style="width:160px;font-size:11px" placeholder="e.g. 3,6,11">
-      </div>
-      {_blackout_hour_grid(coin_hour_wr.get(c,{{}}), settings.get(f'blackout_hours_{c}',''))}
-    </div>""" for c in COINS)}
+    {"".join(_coin_blackout_row(c, coin_hour_wr.get(c, {}), settings) for c in COINS)}
   </div>
 </div>
 <div class="form-row"><span class="form-label">Auto-Pause WR Threshold</span><input type="number" name="autopause_wr_threshold" value="{settings.get('autopause_wr_threshold', 0.42)}" step="0.01" min="0" max="1" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Pause coin if rolling WR (last 15 trades) falls below this. 0 = disabled. Suggested: 0.42</span></div>

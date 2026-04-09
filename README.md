@@ -288,3 +288,120 @@ python3 -c "import ast; ast.parse(open('autobet_main.py').read()); print('OK')"
 | **23:00** | **39%** | **-$32** |
 
 Default blackout covers all net-negative hours. Adjustable in Settings.
+
+---
+
+## Requirements
+
+### Hardware
+
+Autobet runs comfortably on any always-on Linux machine. The current deployment is an **AMD Ryzen 9 6900HX mini-PC** with 60GB RAM, but the actual footprint is minimal:
+
+| Resource | Minimum | Recommended | Notes |
+|---|---|---|---|
+| CPU | Any modern x86_64 or ARM64 | 4+ cores | Decision loop + background threads are light |
+| RAM | 512MB free | 2GB+ | SQLite + Python process; more = headroom for local LLM |
+| Storage | 1GB | 10GB+ | DB grows ~50MB/month at full trading cadence |
+| Network | Stable broadband | Wired/low-latency | Kalshi API calls are time-sensitive; flaky connections miss windows |
+| OS | Linux (Ubuntu 22.04+, Debian 12+) | Same | Tested on x86_64 and ARM64 |
+
+**Always-on requirement:** autobet must run continuously to catch every 15-minute window. A desktop you sleep or a laptop you close will miss trades. Use a mini-PC, server, or VPS.
+
+### Python
+
+- **Python 3.10+** (3.11+ recommended)
+- One non-stdlib dependency: `cryptography` (Kalshi RSA request signing)
+
+```bash
+pip install cryptography
+```
+
+### Accounts & API Keys
+
+| Service | Purpose | Required for | Cost |
+|---|---|---|---|
+| **Kalshi** | Prediction market exchange — placing and resolving trades | Live trading | Free account; funded balance needed for live mode |
+| **MiniMax** | AI decision engine (dual-LLM calls per window) | `minimax_llm` engine (default) | Pay-per-token; ~$0.002–0.005 per decision window |
+| **Polymarket** | Cross-venue price signal + smart money copy-trading | Signal enrichment | No account needed — public API only |
+
+#### Kalshi Setup
+1. Create account at kalshi.com
+2. Fund your account ($20+ for testing; $100+ for live trading)
+3. Generate an API key: Account → API → Create Key
+4. Download the RSA private key (.pem)
+5. Add to `~/autoresearch/.env`:
+   ```
+   KALSHI_KEY_ID=your-key-id-here
+   ```
+6. Place private key at `~/autobet/kalshi.key`
+
+#### MiniMax Setup
+1. Create account at minimax.io
+2. Generate an API key
+3. Add to `~/autoresearch/.env`:
+   ```
+   MINIMAX_API_KEY=your-key-here
+   ```
+
+**No MiniMax?** Switch coins to `rules_engine` or `hybrid` on the Markets page — zero API calls. Or pipe any local LLM (Ollama, llama.cpp) into the `betbot_signal` JSON format.
+
+### Local Model Option (no cloud AI cost)
+
+Any local LLM can replace MiniMax via the `betbot_signal` engine by writing decisions to `~/autoresearch/data/kalshi_signals*.json`. Minimum hardware for useful local inference:
+
+| Setup | Latency | Notes |
+|---|---|---|
+| 7B model, CPU only | 10–30s | Usable — decision window is 3 min |
+| 7B model, GPU 8GB VRAM | 2–5s | Comfortable |
+| 30B+ model, NPU/GPU | <5s | Current ryz.local setup (Nexa SDK + Vulkan) |
+
+A 7B+ model is the practical minimum — smaller models produce inconsistent JSON output.
+
+### Capital
+
+| Mode | Minimum | Notes |
+|---|---|---|
+| Paper trading | $0 | Simulated against real market data, no real money |
+| Live trading | ~$50 | Practical floor given $10 min stake and fees |
+| Live + Pool mode | $200+ | Enough to trade multiple windows without balance risk |
+| Per-coin allocation *(future)* | $400+ | Virtual per-coin budgets within one Kalshi account |
+
+Run paper mode until win rate is consistently above 52% over 100+ trades before going live.
+
+---
+
+## AI Chat Assistant
+
+A floating chat button (bottom-right on every page) gives you a conversational interface to the platform.
+
+### How It Works
+
+1. You type a question in the chat panel
+2. The server fetches live evidence from the DB: last 10 decisions (coin, direction, confidence, result, P&L, rationale), all paper account balances, current prices, and risk settings
+3. All of that context is injected into a prompt sent to **MiniMax** via the Anthropic-compatible API
+4. The reply is displayed in the chat panel and persisted in `localStorage` so history survives page reloads
+
+### What You Can Ask
+
+- **Performance questions** — "Why is SOL losing?" / "What was the last BTC decision?"
+- **Feature explanations** — "What does the entry ceiling do?" / "How does pool mode work?"
+- **Current state** — "What are the current paper balances?" / "Is the kill switch on?"
+- **Strategy questions** — "What does ex-outlier P&L mean?" / "When does the rules engine fire?"
+
+### Grounding
+
+The chat is grounded in real DB state — it sees actual recent decisions and balances, not generic knowledge. It will not hallucinate trade history it cannot see in the evidence snapshot.
+
+### Requirements
+
+- MiniMax API key must be set (`MINIMAX_API_KEY` in `~/autoresearch/.env`)
+- Without a key, the chat returns: *"MiniMax API key not configured."*
+- If the session expires, the chat returns a 401 and prompts you to reload — session cookies persist across server restarts
+
+### Chat Controls
+
+| Action | How |
+|---|---|
+| Send message | Type + Enter |
+| Clear history | Click **Clear** button in chat panel |
+| History persistence | Stored in browser `localStorage` — survives page reloads, cleared on explicit Clear |
