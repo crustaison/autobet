@@ -3084,6 +3084,7 @@ def page_shell(title, active_nav, body, extra_js="", user=None):
         ("/replay",     "Replay"),
         ("/import",     "Import"),
         ("/fill-quality", "Fill Quality"),
+        ("/wallets",    "Smart Money"),
         ("/runs",       "Runs"),
         ("/research",   "Research"),
         ("/providers",  "Providers"),
@@ -3932,6 +3933,161 @@ def build_markets_page(user=None, msg=""):
 
 
 # ── Providers page ──────────────────────────────────────────────────────────────
+def build_wallets_page(user=None):
+    import re as _re
+    conn = db_connect()
+
+    # Tracked wallets
+    wallets_row = conn.execute("SELECT value FROM settings WHERE key='poly_tracked_wallets'").fetchone()
+    tracked = [w.strip() for w in (wallets_row[0] if wallets_row else "").split(",") if w.strip().startswith("0x")]
+
+    # Pull all decisions that have a smart money signal in the rationale
+    rows = conn.execute("""
+        SELECT d.coin, d.window_ts, d.direction, d.confidence, d.rationale,
+               pt.result, pt.pnl
+        FROM decisions d
+        LEFT JOIN paper_trades pt ON pt.coin = d.coin AND pt.window_ts = d.window_ts
+        WHERE d.rationale IS NOT NULL
+        ORDER BY d.window_ts DESC
+        LIMIT 300
+    """).fetchall()
+    conn.close()
+
+    # Parse smart money direction from rationale text
+    # Format: "Smart money (...): X/Y bought YES, A/B bought NO $V → YES lean"
+    sm_pat = _re.compile(r'(\d+)/(\d+) bought YES.*?(\d+)/(\d+) bought NO.*?\$([\d.]+).*?→ (YES|NO) lean', _re.IGNORECASE)
+
+    records = []
+    for coin, wts, direction, confidence, rationale, result, pnl in rows:
+        rat = rationale or ""
+        m = sm_pat.search(rat)
+        if not m:
+            continue
+        yes_n, total1, no_n, total2, vol, sm_dir = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6).upper()
+        yes_n, no_n, vol = int(yes_n), int(no_n), float(vol)
+        total = yes_n + no_n
+
+        # Agreement?
+        agreed = (direction == sm_dir)
+        # Who was right?
+        our_right = sm_right = None
+        if result in ("WIN", "LOSS"):
+            our_right  = (result == "WIN")
+            # Smart money is "right" if their direction matched the outcome
+            sm_right = (sm_dir == direction and result == "WIN") or (sm_dir != direction and result == "LOSS")
+            # More precisely: sm_dir points a way — if that way resolved YES and it ended as WIN for our direction...
+            # Actually: if sm_dir == direction, sm was right iff we won. If sm_dir != direction, sm was right iff we lost.
+            sm_right = (sm_dir == direction) == (result == "WIN")
+
+        records.append({
+            "coin": coin, "wts": wts, "direction": direction, "conf": confidence,
+            "sm_dir": sm_dir, "yes_n": yes_n, "no_n": no_n, "vol": vol, "total": total,
+            "agreed": agreed, "result": result, "pnl": pnl,
+            "our_right": our_right, "sm_right": sm_right,
+        })
+
+    # Summary stats
+    resolved = [r for r in records if r["result"] in ("WIN", "LOSS")]
+    agreed_rec   = [r for r in resolved if r["agreed"]]
+    disagreed_rec = [r for r in resolved if not r["agreed"]]
+    sm_wins   = sum(1 for r in resolved if r["sm_right"])
+    our_wins  = sum(1 for r in resolved if r["our_right"])
+
+    def pct(n, d): return f"{n/d*100:.0f}%" if d else "—"
+
+    summary_html = f"""
+<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px">
+  <div class="card" style="min-width:140px;text-align:center">
+    <div style="font-size:11px;color:#8b949e">Windows w/ SM signal</div>
+    <div style="font-size:24px;font-weight:800">{len(records)}</div>
+    <div style="font-size:11px;color:#8b949e">{len(resolved)} resolved</div>
+  </div>
+  <div class="card" style="min-width:140px;text-align:center">
+    <div style="font-size:11px;color:#8b949e">Our WR (SM windows)</div>
+    <div style="font-size:24px;font-weight:800;color:{'#3fb950' if our_wins/len(resolved)>=0.5 else '#f85149'}">{pct(our_wins, len(resolved))}</div>
+    <div style="font-size:11px;color:#8b949e">{our_wins}/{len(resolved)}</div>
+  </div>
+  <div class="card" style="min-width:140px;text-align:center">
+    <div style="font-size:11px;color:#8b949e">Smart Money WR</div>
+    <div style="font-size:24px;font-weight:800;color:{'#3fb950' if sm_wins/len(resolved)>=0.5 else '#f85149'}">{pct(sm_wins, len(resolved))}</div>
+    <div style="font-size:11px;color:#8b949e">{sm_wins}/{len(resolved)}</div>
+  </div>
+  <div class="card" style="min-width:140px;text-align:center">
+    <div style="font-size:11px;color:#8b949e">When We Agreed</div>
+    <div style="font-size:24px;font-weight:800;color:#58a6ff">{pct(sum(1 for r in agreed_rec if r['our_right']), len(agreed_rec))}</div>
+    <div style="font-size:11px;color:#8b949e">{len(agreed_rec)} trades</div>
+  </div>
+  <div class="card" style="min-width:140px;text-align:center">
+    <div style="font-size:11px;color:#8b949e">When We Disagreed</div>
+    <div style="font-size:24px;font-weight:800;color:#e3b341">{pct(sum(1 for r in disagreed_rec if r['our_right']), len(disagreed_rec))}</div>
+    <div style="font-size:11px;color:#8b949e">{len(disagreed_rec)} trades</div>
+  </div>
+</div>"""
+
+    # Table
+    table_rows = ""
+    for r in records[:150]:
+        t_s = ts_cst(r["wts"]).strftime("%m/%d %H:%M")
+        coin_color = COIN_COLORS.get(r["coin"], "#ccc")
+
+        our_dir_color = "#3fb950" if r["direction"] == "YES" else "#f85149" if r["direction"] == "NO" else "#8b949e"
+        sm_color = "#3fb950" if r["sm_dir"] == "YES" else "#f85149"
+        agree_html = ('<span style="color:#3fb950">✓ agree</span>' if r["agreed"]
+                      else '<span style="color:#e3b341">✗ differ</span>')
+
+        if r["result"] is None:
+            result_html = '<span style="color:#8b949e">open</span>'
+            our_mark = sm_mark = ""
+        elif r["result"] == "WIN":
+            result_html = f'<span style="color:#3fb950">WIN</span> <span style="color:#3fb950;font-size:10px">+${r["pnl"]:.2f}</span>'
+            our_mark = "✓" if r["our_right"] else "✗"
+            sm_mark  = "✓" if r["sm_right"]  else "✗"
+            our_mark_color = "#3fb950" if r["our_right"] else "#f85149"
+            sm_mark_color  = "#3fb950" if r["sm_right"]  else "#f85149"
+        else:
+            result_html = f'<span style="color:#f85149">LOSS</span> <span style="color:#f85149;font-size:10px">${r["pnl"]:.2f}</span>'
+            our_mark = "✓" if r["our_right"] else "✗"
+            sm_mark  = "✓" if r["sm_right"]  else "✗"
+            our_mark_color = "#3fb950" if r["our_right"] else "#f85149"
+            sm_mark_color  = "#3fb950" if r["sm_right"]  else "#f85149"
+
+        if r["result"] is None:
+            our_mark_color = sm_mark_color = "#8b949e"
+
+        sm_ratio = f"{r['yes_n']}/{r['total']} YES · {r['no_n']}/{r['total']} NO · ${r['vol']:.0f}"
+
+        table_rows += f"""<tr>
+<td>{t_s}</td>
+<td><span style="color:{coin_color};font-weight:700">{r['coin']}</span></td>
+<td><span style="color:{our_dir_color};font-weight:700">{r['direction']}</span> <span style="color:#8b949e;font-size:10px">{r['conf']:.0%}</span> <span style="color:{our_mark_color}">{our_mark}</span></td>
+<td><span style="color:{sm_color};font-weight:700">{r['sm_dir']}</span> <span style="color:#8b949e;font-size:10px">{sm_ratio}</span> <span style="color:{sm_mark_color}">{sm_mark}</span></td>
+<td>{agree_html}</td>
+<td>{result_html}</td>
+</tr>"""
+
+    wallet_list_html = ""
+    if tracked:
+        wallet_list_html = '<div class="section-title" style="margin-top:24px">Tracked Wallets</div><div class="card"><div style="display:flex;flex-wrap:wrap;gap:8px">'
+        for w in tracked:
+            short = w[:6] + "…" + w[-4:]
+            wallet_list_html += f'<span style="background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:3px 10px;font-size:12px;font-family:monospace;color:#8b949e" title="{w}">{short}</span>'
+        wallet_list_html += f'</div><div style="font-size:11px;color:#555;margin-top:8px">{len(tracked)} wallets tracked · signals polled every 90s · last 20min activity window</div></div>'
+
+    body = '<div class="page-header">Smart Money</div>\n'
+    body += '<div class="page-sub">Our decisions vs Polymarket top-wallet signals, and who was right.</div>\n'
+    body += summary_html
+    body += wallet_list_html
+    body += '<div class="section-title" style="margin-top:20px">Decision Comparison</div>\n'
+    if not records:
+        body += '<div class="card"><div class="muted">No decisions with smart money signals yet — signals appear once wallets have recent activity.</div></div>'
+    else:
+        body += '''<div class="card" style="overflow-x:auto">
+<table class="trade-table">
+<tr><th>Time (CT)</th><th>Coin</th><th>Our Call</th><th>Smart Money</th><th>Agreement</th><th>Outcome</th></tr>
+''' + table_rows + '</table></div>\n'
+
+    return build_page("Smart Money", body, active="wallets", user=user)
+
 def build_providers_page(user=None):
     with _state_lock:
         health = dict(_health_status)
@@ -4898,6 +5054,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html(build_import_page(user=user))
             elif path == "/fill-quality":
                 self.send_html(build_fill_quality_page(user=user))
+            elif path == "/wallets":
+                self.send_html(build_wallets_page(user=user))
             elif path == "/engines":
                 self.send_html(build_engines_page(user=user))
             elif path == "/health":
