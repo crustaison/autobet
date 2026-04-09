@@ -118,7 +118,26 @@ def get_minimax_model():
 # Keep MINIMAX_MODEL as a property-like alias for startup use only.
 # Always call get_minimax_model() at decision/display time.
 MINIMAX_MODEL = _MINIMAX_MODEL_DEFAULT
-SESSION_SECRET = ENV.get("AUTOBET_SECRET", secrets.token_hex(32))
+def _load_session_secret():
+    secret = ENV.get("AUTOBET_SECRET", "")
+    if secret:
+        return secret
+    # Persist secret in DB so restarts don't invalidate sessions
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM _meta WHERE key='session_secret'").fetchone()
+        if row:
+            conn.close()
+            return row[0]
+        new_secret = secrets.token_hex(32)
+        conn.execute("INSERT INTO _meta (key, value) VALUES ('session_secret', ?)", (new_secret,))
+        conn.commit()
+        conn.close()
+        return new_secret
+    except Exception:
+        return secrets.token_hex(32)
+SESSION_SECRET = _load_session_secret()
 
 # ── Kalshi RSA auth ─────────────────────────────────────────────────────────────
 def _load_pem_key():
@@ -3125,7 +3144,10 @@ document.getElementById('detail-modal').addEventListener('click', function(e){{ 
 <div id="chat-panel">
   <div id="chat-header">
     <span>Autobet Chat</span>
-    <button class="btn" onclick="toggleChat()" style="padding:2px 8px">✕</button>
+    <div style="display:flex;gap:6px">
+      <button class="btn" onclick="clearChat()" style="padding:2px 8px;font-size:11px;color:#8b949e" title="Clear history">clear</button>
+      <button class="btn" onclick="toggleChat()" style="padding:2px 8px">✕</button>
+    </div>
   </div>
   <div id="chat-msgs"></div>
   <div id="chat-input-row">
@@ -3135,33 +3157,80 @@ document.getElementById('detail-modal').addEventListener('click', function(e){{ 
 </div>
 
 <script>
-setTimeout(() => location.reload(), 60000);
+var _reloadTimer = setTimeout(() => {{ if (!document.getElementById('chat-panel').classList.contains('open')) location.reload(); else setTimeout(() => location.reload(), 30000); }}, 60000);
 {extra_js}
+// Chat persistence
+var CHAT_KEY = 'autobet_chat_v1';
+function chatSave(msgs) {{ try {{ localStorage.setItem(CHAT_KEY, JSON.stringify(msgs)); }} catch(e) {{}} }}
+function chatLoad() {{ try {{ return JSON.parse(localStorage.getItem(CHAT_KEY) || '[]'); }} catch(e) {{ return []; }} }}
 function toggleChat() {{
   var p = document.getElementById('chat-panel');
   p.classList.toggle('open');
+  if (p.classList.contains('open')) {{
+    var msgs = document.getElementById('chat-msgs');
+    msgs.scrollTop = msgs.scrollHeight;
+  }}
 }}
+// Restore chat history on page load
+(function() {{
+  var history = chatLoad();
+  history.forEach(function(m) {{ appendChat(m.role, m.text, false); }});
+}})();
 function sendChat() {{
   var inp = document.getElementById('chat-input');
   var msg = inp.value.trim();
   if (!msg) return;
   inp.value = '';
   appendChat('user', msg);
+  var sendBtn = document.getElementById('chat-send');
+  sendBtn.disabled = true;
+  sendBtn.textContent = '…';
+  var typing = document.createElement('div');
+  typing.className = 'chat-msg assistant';
+  typing.id = 'chat-typing';
+  typing.innerHTML = '<span style="letter-spacing:2px">&#8226;&#8226;&#8226;</span>';
+  typing.style.opacity = '0.5';
+  document.getElementById('chat-msgs').appendChild(typing);
+  document.getElementById('chat-msgs').scrollTop = 99999;
   fetch('/api/chat', {{
     method: 'POST',
+    credentials: 'same-origin',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{message: msg}})
-  }}).then(r => r.json()).then(d => {{
+  }}).then(function(r) {{
+    if (r.status === 401) throw new Error('Session expired — reload the page to log in again');
+    return r.json();
+  }}).then(function(d) {{
+    var t = document.getElementById('chat-typing');
+    if (t) t.remove();
     appendChat('assistant', d.reply || d.error || 'No response');
-  }}).catch(e => appendChat('assistant', 'Error: ' + e));
+  }}).catch(function(e) {{
+    var t = document.getElementById('chat-typing');
+    if (t) t.remove();
+    appendChat('assistant', 'Error: ' + e.message);
+  }}).finally(function() {{
+    sendBtn.disabled = false;
+    sendBtn.textContent = 'Send';
+  }});
 }}
-function appendChat(role, text) {{
+function appendChat(role, text, save) {{
+  if (save === undefined) save = true;
   var msgs = document.getElementById('chat-msgs');
   var div = document.createElement('div');
   div.className = 'chat-msg ' + role;
   div.textContent = text;
   msgs.appendChild(div);
   msgs.scrollTop = msgs.scrollHeight;
+  if (save) {{
+    var history = chatLoad();
+    history.push({{role: role, text: text}});
+    if (history.length > 40) history = history.slice(-40);
+    chatSave(history);
+  }}
+}}
+function clearChat() {{
+  localStorage.removeItem(CHAT_KEY);
+  document.getElementById('chat-msgs').innerHTML = '';
 }}
 </script>
 </body>
@@ -3488,7 +3557,7 @@ def build_dashboard(user=None):
                     bar_color = "#3fb950" if unreal >= 0 else "#f85149"
                     entry_s = f"{avg_p*100:.0f}¢"
                     cur_s   = f"{cur_val*100:.0f}¢"
-                    active_html = f'''<div style="margin-bottom:4px;padding:5px 8px;border-radius:5px;background:#0d1117;border:1px solid {unreal_color}">
+                    active_html = f'''<div style="margin-bottom:4px;padding:4px 0;border-bottom:1px solid #21262d">
   <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
     <span style="font-size:9px;background:{unreal_color};color:#000;padding:1px 5px;border-radius:3px;font-weight:700">LIVE</span>
     <span style="font-size:11px;color:#e6edf3;font-weight:700">{lo_dir}</span>
@@ -3517,24 +3586,24 @@ def build_dashboard(user=None):
                     if h_pnl > 0:
                         row_color = "#3fb950"
                         result_s  = "WIN"
-                        pnl_s     = f'<span style="color:#3fb950;font-weight:700;margin-left:auto">+${h_pnl:.2f}</span>'
+                        pnl_s     = f'<span style="color:#3fb950;font-weight:700;margin-left:auto;flex-shrink:0;font-size:10px">+${h_pnl:.2f}</span>'
                     else:
                         row_color = "#f85149"
                         result_s  = "LOSS"
-                        pnl_s     = f'<span style="color:#f85149;font-weight:700;margin-left:auto">-${abs(h_pnl):.2f}</span>'
+                        pnl_s     = f'<span style="color:#f85149;font-weight:700;margin-left:auto;flex-shrink:0;font-size:10px">-${abs(h_pnl):.2f}</span>'
                 else:
                     row_color = "#e3b341"
                     result_s  = h_status
                     pnl_s     = ""
                 entry_disp = f"{float(h_avg_price)*100:.0f}¢" if h_avg_price else "—"
-                rows_html += f'<div style="display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px solid #21262d">' \
-                             f'<span style="font-size:9px;color:#555;min-width:30px">{h_time_s}</span>' \
-                             f'<span style="font-size:10px;color:#e6edf3;font-weight:600;min-width:24px">{h_dir}</span>' \
-                             f'<span style="font-size:10px;color:#8b949e">{h_contracts}c @ {entry_disp}</span>' \
-                             f'<span style="font-size:10px;color:{row_color};margin-left:4px">{result_s}</span>' \
+                rows_html += f'<div style="display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px solid #21262d;min-width:0">' \
+                             f'<span style="font-size:9px;color:#6e7681;min-width:30px;flex-shrink:0">{h_time_s}</span>' \
+                             f'<span style="font-size:10px;color:#e6edf3;font-weight:600;min-width:22px;flex-shrink:0">{h_dir}</span>' \
+                             f'<span style="font-size:10px;color:#8b949e;flex-shrink:0">{h_contracts}c @ {entry_disp}</span>' \
+                             f'<span style="font-size:10px;color:{row_color};margin-left:4px;flex-shrink:0">{result_s}</span>' \
                              f'{pnl_s}</div>'
             if rows_html or active_html:
-                live_indicator = f'<div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:#0d1117;border:1px solid #30363d" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
+                live_indicator = f'<div style="margin-top:6px;padding:6px 0 4px 0;border-top:1px solid #21262d;overflow:hidden;box-sizing:border-box;width:100%" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
                                  f'<div style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">LIVE ORDERS</div>' \
                                  f'{active_html}{rows_html}</div>'
             else:
@@ -4658,10 +4727,15 @@ Answer the user's question concisely using the above context. If asked about a s
         with urllib.request.urlopen(req, timeout=90) as r:
             resp = json.loads(r.read().decode())
             text = ""
+            thinking_text = ""
             for block in resp.get("content", []):
                 if block.get("type") == "text":
                     text = block.get("text", "").strip()
                     break
+                elif block.get("type") == "thinking" and not thinking_text:
+                    thinking_text = block.get("thinking", "").strip()
+            if not text and thinking_text:
+                text = thinking_text
             # Log to audit
             with _state_lock:
                 _health_status["minimax"] = {"ok": True, "msg": "Last chat response ok", "ts": int(time.time())}
@@ -4928,7 +5002,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Auth-required POSTs
         user = get_session(self)
         if not user and is_onboarding_complete():
-            self.redirect("/login")
+            if path == "/api/chat":
+                self.send_json({"error": "Session expired — reload the page to log in again"}, 401)
+            else:
+                self.redirect("/login")
             return
 
         if path == "/settings/save":
@@ -5098,11 +5175,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.redirect("/engines?saved=1")
 
         elif path == "/api/chat":
+            chat_user = get_session(self)
+            if not chat_user and is_onboarding_complete():
+                self.send_json({"error": "session expired — please reload and log in again"}, 401)
+                return
             message = params.get("message", "")
             if not message:
                 self.send_json({"error": "empty message"}, 400)
                 return
-            reply = handle_chat(message, user=user)
+            reply = handle_chat(message, user=chat_user)
             self.send_json(reply)
 
         else:
