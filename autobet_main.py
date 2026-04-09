@@ -1126,16 +1126,45 @@ def collect_kalshi():
 
 # ── Polymarket copy-trading wallet discovery ────────────────────────────────────
 POLY_COPY_SEED = [
-    "0xdE17f7144fbD0eddb2679132C10ff5e74B120988",  # #1 leaderboard +$723k
-    "0xB27BC932bf8110D8F78e55da7d5f0497A18B5b82",  # #5 +$412k
-    "0x1f0ebc543B2d411f66947041625c0Aa1ce61CF86",  # #7 +$379k
+    # Direct wallet addresses from leaderboard (top 20 crypto/weekly/profit)
+    "0xdE17f7144fbD0eddb2679132C10ff5e74B120988",  # #1  +$723k
+    "0xB27BC932bf8110D8F78e55da7d5f0497A18B5b82",  # #5  +$412k
+    "0x1f0ebc543B2d411f66947041625c0Aa1ce61CF86",  # #7  +$379k
     "0xd1ebE815f921b3EbBD8d9e0a4192C6Ab18360F5c",  # #12 +$225k
+    # Resolved via proxyWallet from profile pages (@username → 0x...)
+    "0xd84c2b6d65dc596f49c7b6aadd6d74ca91e407b9",  # BoneReader    #2  +$604k
+    "0xd0d6053c3c37e727402d84c14069780d360993aa",  # k9Q2mX4L8A7ZP3R #3 +$506k
+    "0x2d8b401d2f0e6937afebf18e19e11ca568a5260a",  # vidarx         #6  +$398k
+    "0x0006af12cd4dacc450836a0e1ec6ce47365d8c63",  # stingo43       #8  +$323k
+    "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",  # Bonereaper     #10 +$309k
+    "0x29bc82f761749e67fa00d62896bc6855097b683c",  # BoshBashBish   #13 +$198k
+    "0x70ec235a31eb35f243e2618d6ea3b5b8962bbb5d",  # vague-sourdough #14 +$190k
+    "0xa45fe11dd1420fca906ceac2c067844379a42429",  # guh123         #15 +$187k
+    "0x89b5cdaaa4866c1e738406712012a630b4078beb",  # ohanism        #19 +$164k
+    "0xe9c6312464b52aa3eff13d822b003282075995c9",  # kingofcoinflips #20 +$163k
+    "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",  # 0x8dxd
+    "0x732f189193d7a8c8bc8d8eb91f501a22736af081",  # 0x732F1
 ]
 POLY_CRYPTO_KWS = ["bitcoin","btc","ethereum","eth","solana","sol","xrp","ripple","doge","bnb","hype"]
 _last_wallet_discover = 0   # epoch timestamp of last leaderboard scrape
 
+def _resolve_username_wallet(username):
+    """Fetch a Polymarket profile page and extract the proxyWallet address."""
+    import re as _re3
+    try:
+        req = urllib.request.Request(
+            f"https://polymarket.com/@{username}",
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36"}
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+        wallets = _re3.findall(r'"proxyWallet"\s*:\s*"(0x[0-9a-fA-F]{40})"', html)
+        return wallets[0] if wallets else None
+    except Exception:
+        return None
+
 def _discover_poly_wallets():
-    """Scrape Polymarket crypto leaderboard, test each wallet for activity, save top ones."""
+    """Scrape Polymarket crypto leaderboard (addresses + usernames), resolve all to wallets."""
     global _last_wallet_discover
     import re as _re2
     try:
@@ -1146,16 +1175,36 @@ def _discover_poly_wallets():
         )
         with urllib.request.urlopen(req, timeout=15) as r:
             html = r.read().decode("utf-8", errors="ignore")
-        # Extract all valid 40-char hex addresses
-        found = list(dict.fromkeys(
+
+        # Extract raw 0x addresses directly embedded in the page
+        addr_found = list(dict.fromkeys(
             a for a in _re2.findall(r'0x[0-9a-fA-F]{40}\b', html)
             if len(a) == 42
         ))
-        print(f"[COPY] Leaderboard scrape: {len(found)} unique addresses")
+
+        # Extract usernames (non-address display names in leaderboard entries)
+        # Leaderboard names appear as /@username links
+        usernames = list(dict.fromkeys(_re2.findall(r'/@([A-Za-z0-9_\-\.]{3,30})"', html)))
+        # Filter out ones that look like raw addresses (they start with 0x)
+        usernames = [u for u in usernames if not u.startswith("0x")]
+        print(f"[COPY] Leaderboard scrape: {len(addr_found)} addresses, {len(usernames)} usernames")
+
+        # Resolve usernames to proxyWallet addresses
+        resolved = []
+        for uname in usernames[:20]:
+            addr = _resolve_username_wallet(uname)
+            if addr:
+                resolved.append(addr)
+                print(f"[COPY] Resolved @{uname} → {addr}")
+            time.sleep(0.3)
+
+        all_candidates = list(dict.fromkeys(
+            a.lower() for a in addr_found + resolved if len(a) == 42
+        ))
 
         # Test each — keep only those with recent crypto activity
         good = []
-        for addr in found[:40]:  # limit to top 40 to avoid rate limiting
+        for addr in all_candidates[:50]:
             try:
                 url = f"https://data-api.polymarket.com/activity?user={addr}&limit=20"
                 req2 = urllib.request.Request(url, headers={"User-Agent": "autobet/1.0"})
@@ -1164,26 +1213,25 @@ def _discover_poly_wallets():
                 crypto = [a for a in acts if any(
                     kw in (a.get("title") or "").lower() for kw in POLY_CRYPTO_KWS
                 )]
-                if len(crypto) >= 3:  # at least 3 crypto trades in recent history
+                if len(crypto) >= 3:
                     good.append(addr)
             except Exception:
                 pass
-            time.sleep(0.4)
+            time.sleep(0.3)
 
-        # Merge with seeds, deduplicate (keep checksummed version)
+        # Merge with seeds, deduplicate
         seen_lower = {}
         for a in POLY_COPY_SEED + good:
             seen_lower[a.lower()] = a
-        merged = list(seen_lower.values())[:25]  # cap at 25 wallets
+        merged = list(seen_lower.values())[:35]  # cap at 35 wallets
 
-        # Save to settings
         conn_w = db_connect()
         conn_w.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                        ("poly_tracked_wallets", ",".join(merged), now_cst().isoformat()))
         conn_w.commit()
         conn_w.close()
         _last_wallet_discover = int(time.time())
-        print(f"[COPY] Auto-discovered {len(good)} new wallets, total tracked: {len(merged)}")
+        print(f"[COPY] Discovery complete: {len(resolved)} usernames resolved, {len(good)} active crypto wallets, {len(merged)} total tracked")
         return merged
     except Exception as e:
         print(f"[COPY] Discovery failed: {e}")
