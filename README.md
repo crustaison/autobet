@@ -80,8 +80,6 @@ Two independent MiniMax M2.5 calls run in parallel every decision window:
 - Disagree → confidence penalized: `primary_conf × 0.65`, rationale tagged `[skeptic disagrees ↓]`
 - One fails/times out → other's result used alone
 
-Previously used a local Qwen3.5-35B-A3B subprocess as the second LLM (3.5 tok/s, ~20s, semaphore-limited to 1 concurrent). Replaced with second MiniMax call: ~4x faster, no hardware bottleneck, no semaphore needed.
-
 ### What the LLM sees per window
 
 The prompt fed to both LLMs includes:
@@ -270,28 +268,6 @@ Configurable from the Settings page:
 python3 -c "import ast; ast.parse(open('autobet_main.py').read()); print('OK')"
 ```
 
----
-
-## Host Machine — ryz.local
-
-**Hardware:** AMD Ryzen 9 6900HX (16 threads, 4.9GHz boost), 60GB RAM, Radeon 680M iGPU (3GB VRAM shared), x86_64
-
-**Nexa SDK:** v0.2.73 at `/opt/nexa_sdk/`, served on port 18181 (for embeddings/small models)
-
-**Performance tuning applied (reapply after reboot):**
-
-```bash
-# Transparent hugepages — reduces TLB pressure on large model files
-echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
-echo always | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
-
-# Pin 35B model file in RAM page cache (19GB — eliminates cold-load disk I/O)
-vmtouch -t ~/.cache/nexa.ai/nexa_sdk/models/unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_M.gguf
-```
-
-CPU governor is permanently set to `performance` via systemd. Swap is 15GB but swappiness=10 so RAM is preferred.
-
-**Local model benchmarks (Qwen3.5-35B-A3B Q4_K_M, warm):** 3.5 tok/s — hardware ceiling for a 19GB model on 16-thread CPU with no GPU offload. This is why the dual-LLM was switched to two MiniMax M2.5 API calls instead.
 
 ## Win Rate by Hour (CT) — basis for default blackout hours
 
