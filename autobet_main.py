@@ -229,6 +229,194 @@ def place_kalshi_order(coin, ticker, direction, contracts, entry):
     order_id = (resp or {}).get("order", {}).get("order_id")
     return order_id, live_ticker, None
 
+def sell_kalshi_position(ticker, direction, contracts, exit_price):
+    """
+    Sell (exit) an existing Kalshi position before settlement.
+    Selling NO = placing a sell order on the no side.
+    exit_price: the current market bid for our side (what we'd receive per contract).
+    Returns (order_id, error_str)
+    """
+    side = "yes" if direction == "YES" else "no"
+    # Sell at market bid minus 1¢ to ensure fill
+    limit_price = max(1, min(99, round(exit_price * 100)))
+    body = {
+        "ticker": ticker,
+        "client_order_id": f"autobet_exit_{ticker}_{int(time.time())}",
+        "type": "limit",
+        "action": "sell",
+        "side": side,
+        "count": int(contracts),
+        "yes_price": limit_price if direction == "YES" else (100 - limit_price),
+    }
+    resp, err = kalshi_post("/portfolio/orders", body)
+    if err:
+        return None, err
+    order_id = (resp or {}).get("order", {}).get("order_id")
+    return order_id, None
+
+def check_exit_positions():
+    """
+    Evaluate active live positions for early exit.
+    Called every 60s from sync thread.
+    Rules (configurable in settings):
+      - Take profit:  unrealized >= take_profit_pct% of stake
+      - Stop loss:    unrealized <= -stop_loss_pct% of stake
+      - Time cliff:   secs_left <= time_cliff_secs and any unrealized profit
+      - LLM check:    at ~midpoint (secs_left ~450), ask LLM hold/sell
+    """
+    try:
+        conn = db_connect()
+        # Load thresholds from settings
+        def _setting(key, default):
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return float(row[0]) if row else default
+        take_profit_pct = _setting("exit_take_profit_pct", 40.0)
+        stop_loss_pct   = _setting("exit_stop_loss_pct",   65.0)
+        time_cliff_secs = _setting("exit_time_cliff_secs", 90.0)
+        llm_exit_enabled = _setting("exit_llm_check", 1.0)
+
+        now = int(time.time())
+        wts = kalshi_window_ts()
+        secs_left = max(0, wts + 900 - now)
+
+        # Get filled live orders for current window not yet exited
+        positions = conn.execute("""
+            SELECT id, coin, ticker, direction, filled_contracts, avg_fill_price
+            FROM live_orders
+            WHERE window_ts = ? AND status IN ('filled','executed','filled_partial')
+              AND filled_contracts > 0 AND avg_fill_price > 0
+              AND exit_at IS NULL
+        """, (wts,)).fetchall()
+        conn.close()
+
+        if not positions:
+            return
+
+        with _state_lock:
+            mkts = {k: dict(v) for k, v in _active_mkts.items()}
+
+        for pos in positions:
+            lo_id, coin, ticker, direction, n_filled, avg_price = pos
+            n = int(n_filled)
+            avg_p = float(avg_price)
+            mkt = mkts.get(coin, {})
+            yes_bid = float(mkt.get("yes_bid") or 0)
+            yes_ask = float(mkt.get("yes_ask") or 0)
+            if not yes_bid or not yes_ask:
+                continue
+
+            # Current exit value and unrealized P&L
+            if direction == "NO":
+                cur_bid = 1.0 - yes_ask   # what we'd get selling NO right now (bid side)
+                cur_val = 1.0 - yes_bid   # mid value
+            else:
+                cur_bid = yes_bid
+                cur_val = yes_bid
+
+            stake   = n * avg_p
+            unreal  = n * (cur_val - avg_p)
+            unreal_pct = (unreal / stake * 100) if stake > 0 else 0
+
+            reason = None
+
+            # Rule 1: Take profit
+            if unreal_pct >= take_profit_pct:
+                reason = f"take_profit ({unreal_pct:+.0f}% >= {take_profit_pct:.0f}%)"
+
+            # Rule 2: Stop loss
+            elif unreal_pct <= -stop_loss_pct:
+                reason = f"stop_loss ({unreal_pct:+.0f}% <= -{stop_loss_pct:.0f}%)"
+
+            # Rule 3: Time cliff — exit any winning position in last N seconds
+            elif secs_left <= time_cliff_secs and unreal > 0:
+                reason = f"time_cliff ({secs_left}s left, up {unreal_pct:+.0f}%)"
+
+            # Rule 4: LLM mid-window check (once, around secs_left=430-470)
+            elif llm_exit_enabled and 430 <= secs_left <= 470 and abs(unreal_pct) > 5:
+                reason = _llm_exit_check(coin, direction, n, avg_p, cur_val, unreal, secs_left, mkt)
+
+            if reason:
+                # Place sell order
+                order_id, err = sell_kalshi_position(ticker, direction, n, cur_bid)
+                exit_pnl = round(n * (cur_bid - avg_p), 4)
+                conn2 = db_connect()
+                if order_id:
+                    conn2.execute("""
+                        UPDATE live_orders SET exit_price=?, exit_at=?, exit_reason=?, status='exited'
+                        WHERE id=?
+                    """, (round(cur_bid, 4), now_cst().isoformat(), reason, lo_id))
+                    conn2.commit()
+                    print(f"[EXIT] {coin} {direction} {n}c: {reason} | exit@{cur_bid:.3f} entry@{avg_p:.3f} pnl={exit_pnl:+.2f}")
+                    audit("position_exited", "live_orders", str(lo_id),
+                          {"coin": coin, "direction": direction, "contracts": n,
+                           "entry": avg_p, "exit": cur_bid, "pnl": exit_pnl, "reason": reason})
+                else:
+                    print(f"[EXIT] {coin}: sell order failed — {err}")
+                conn2.close()
+    except Exception as e:
+        print(f"[EXIT CHECK] {e}")
+
+def _llm_exit_check(coin, direction, n, avg_price, cur_val, unreal, secs_left, mkt):
+    """
+    Ask the dual-LLM whether to hold or exit the current position.
+    Returns an exit reason string if it recommends selling, None to hold.
+    """
+    try:
+        yes_bid = float(mkt.get("yes_bid") or 0)
+        yes_ask = float(mkt.get("yes_ask") or 0)
+        mid = (yes_bid + yes_ask) / 2 if yes_bid and yes_ask else 0
+        unreal_pct = (unreal / (n * avg_price) * 100) if avg_price > 0 else 0
+
+        prompt = f"""You are managing an active position in a 15-minute {coin} prediction market contract.
+
+Position: {direction} {n} contracts, entered at {avg_price:.2f} ({avg_price*100:.0f}¢)
+Current market: yes_bid={yes_bid:.3f} yes_ask={yes_ask:.3f} mid={mid:.3f}
+Current {direction} value: {cur_val:.3f} ({cur_val*100:.0f}¢)
+Unrealized P&L: {unreal:+.2f} ({unreal_pct:+.0f}% of stake)
+Time remaining: {secs_left}s (~{secs_left//60}m {secs_left%60}s)
+
+Should you hold this position to settlement or sell now to lock in the current value?
+Consider: remaining time, market momentum, probability of improvement vs reversal.
+
+Respond with JSON only:
+{{"action": "hold" or "sell", "rationale": "one line reason"}}"""
+
+        import threading as _t
+        results = {}
+        def _mm():
+            try:
+                import urllib.request as _ur
+                payload = json.dumps({"model": get_minimax_model(), "max_tokens": 256,
+                                      "messages": [{"role": "user", "content": prompt}]}).encode()
+                req = _ur.Request(MINIMAX_URL, data=payload,
+                                  headers={"Content-Type": "application/json",
+                                           "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"})
+                with _ur.urlopen(req, timeout=25) as r:
+                    resp = json.loads(r.read())
+                    for block in resp.get("content", []):
+                        if block.get("type") == "text":
+                            text = block["text"].strip()
+                            if "```" in text:
+                                text = text.split("```")[1].lstrip("json").strip()
+                            results["mm"] = json.loads(text)
+                            break
+            except Exception:
+                pass
+
+        t = _t.Thread(target=_mm, daemon=True)
+        t.start()
+        t.join(timeout=28)
+
+        r = results.get("mm")
+        if r and r.get("action") == "sell":
+            print(f"[EXIT LLM] {coin}: sell recommended — {r.get('rationale','')[:80]}")
+            return f"llm_sell ({r.get('rationale','')[:60]})"
+        elif r:
+            print(f"[EXIT LLM] {coin}: hold recommended — {r.get('rationale','')[:80]}")
+    except Exception as e:
+        print(f"[EXIT LLM] {coin}: {e}")
+    return None
+
 def sync_live_orders():
     """
     Poll Kalshi for status of placed orders and sync actual fill/P&L into live_orders.
@@ -330,6 +518,7 @@ def live_order_sync_loop():
         try:
             sync_live_orders()
             sync_kalshi_balance()
+            check_exit_positions()
         except Exception as e:
             print(f"[LIVE SYNC LOOP] {e}")
         time.sleep(60)
@@ -404,10 +593,13 @@ def db_migrate(conn):
         conn.execute("ALTER TABLE paper_trades ADD COLUMN run_id INTEGER")
         print("[DB] Added run_id to paper_trades")
 
-    # live_orders: add settlement columns if missing
+    # live_orders: add settlement + exit columns if missing
     lo_cols = [r[1] for r in conn.execute("PRAGMA table_info(live_orders)").fetchall()]
     if lo_cols:
-        for col, typedef in [("pnl", "REAL"), ("actual_direction", "TEXT"), ("resolved_at", "TEXT")]:
+        for col, typedef in [
+            ("pnl", "REAL"), ("actual_direction", "TEXT"), ("resolved_at", "TEXT"),
+            ("exit_price", "REAL"), ("exit_at", "TEXT"), ("exit_reason", "TEXT"),
+        ]:
             if col not in lo_cols:
                 conn.execute(f"ALTER TABLE live_orders ADD COLUMN {col} {typedef}")
                 print(f"[DB] Added {col} to live_orders")
@@ -619,7 +811,9 @@ def db_init():
     """, (now_cst().isoformat(),))
 
     # Seed default filter settings (won't overwrite existing values)
-    for k, v in [("min_confidence", "0.55"), ("min_volume", "500")]:
+    for k, v in [("min_confidence", "0.55"), ("min_volume", "500"),
+                 ("exit_take_profit_pct", "40"), ("exit_stop_loss_pct", "65"),
+                 ("exit_time_cliff_secs", "90"), ("exit_llm_check", "1")]:
         conn.execute("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                      (k, v, now_cst().isoformat()))
 
@@ -3345,6 +3539,13 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Max Stake ($) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_stake" value="{rs['max_stake']:.0f}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Cooldown After N Losses {tooltip_html("cooldown_after_losses")}</span><input type="number" name="cooldown_after_losses" value="{rs['cooldown_after_losses']}" step="1" min="0" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Min Volume (contracts) {tooltip_html("min_volume")}</span><input type="number" name="min_volume" value="{settings.get('min_volume', 500)}" step="50" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Skip windows below this 24h volume. 0 = disabled.</span></div>
+<div style="margin-top:16px;padding-top:14px;border-top:1px solid #21262d">
+  <div style="font-size:12px;font-weight:600;color:#58a6ff;margin-bottom:10px">Early Exit Engine</div>
+  <div class="form-row"><span class="form-label">Take Profit (%)</span><input type="number" name="exit_take_profit_pct" value="{settings.get('exit_take_profit_pct', 40)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell when unrealized P&L ≥ this % of stake. 0 = disabled.</span></div>
+  <div class="form-row"><span class="form-label">Stop Loss (%)</span><input type="number" name="exit_stop_loss_pct" value="{settings.get('exit_stop_loss_pct', 65)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell when losing ≥ this % of stake (recovers remaining value). 0 = disabled.</span></div>
+  <div class="form-row"><span class="form-label">Time Cliff (secs)</span><input type="number" name="exit_time_cliff_secs" value="{settings.get('exit_time_cliff_secs', 90)}" step="10" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell any winning position when this many seconds remain. 0 = disabled.</span></div>
+  <div class="form-row"><span class="form-label">LLM Mid-Window Check</span><select name="exit_llm_check" style="width:100px"><option value="1" {"selected" if settings.get("exit_llm_check","1")=="1" else ""}>Enabled</option><option value="0" {"selected" if settings.get("exit_llm_check","1")=="0" else ""}>Disabled</option></select><span style="color:#8b949e;font-size:11px;margin-left:8px">Ask LLM to evaluate hold/sell at ~midpoint of window.</span></div>
+</div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Risk Settings</button></div>
 </form>'''
     body += '</div>\n'
@@ -4236,8 +4437,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 UPDATE risk_settings SET kill_switch=?, daily_loss_limit=?, max_drawdown_pct=?,
                 max_stake=?, cooldown_after_losses=?, updated_at=? WHERE id=1
             """, (ks, dll, mdd, ms, cal, now_cst().isoformat()))
-            conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('min_volume',?,?)",
-                         (str(mv), now_cst().isoformat()))
+            for key, default in [("min_volume", mv), ("min_confidence", float(params.get("min_confidence", 0.55))),
+                                  ("exit_take_profit_pct", float(params.get("exit_take_profit_pct", 40))),
+                                  ("exit_stop_loss_pct",   float(params.get("exit_stop_loss_pct", 65))),
+                                  ("exit_time_cliff_secs", float(params.get("exit_time_cliff_secs", 90))),
+                                  ("exit_llm_check",       params.get("exit_llm_check", "1"))]:
+                conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                             (key, str(default), now_cst().isoformat()))
             conn.commit()
             conn.close()
             audit("risk_settings_saved", "risk_settings", payload={"kill_switch": ks, "daily_loss_limit": dll},
