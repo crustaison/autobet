@@ -4074,11 +4074,47 @@ def build_audit_page(user=None):
 
 
 # ── Settings page ───────────────────────────────────────────────────────────────
+def _blackout_hour_grid(hour_wr, blackout_str):
+    """Render a 24-cell hour grid showing WR and blocked status."""
+    blocked = set(int(h.strip()) for h in blackout_str.split(",") if h.strip().isdigit())
+    cells = []
+    for h in range(24):
+        wr, n = hour_wr.get(h, (None, 0))
+        is_blocked = h in blocked
+        if wr is None:
+            bg = "#161b22"; label = f"{h:02d}"; sub = "no data"; txt = "#555"
+        elif n < BLACKOUT_MIN_TRADES:
+            bg = "#1c2128"; label = f"{h:02d}"; sub = f"{wr:.0%} ({n})"; txt = "#6e7681"
+        elif wr >= BLACKOUT_UNBLOCK_WR:
+            bg = "#0d2818"; label = f"{h:02d}"; sub = f"{wr:.0%}"; txt = "#3fb950"
+        elif wr < BLACKOUT_BLOCK_WR:
+            bg = "#2d1515"; label = f"{h:02d}"; sub = f"{wr:.0%}"; txt = "#f85149"
+        else:
+            bg = "#1c2128"; label = f"{h:02d}"; sub = f"{wr:.0%}"; txt = "#e3b341"
+        border = "2px solid #f85149" if is_blocked else "1px solid #30363d"
+        cells.append(f'<div style="background:{bg};border:{border};border-radius:4px;padding:3px 4px;text-align:center;min-width:30px">'
+                     f'<div style="font-size:10px;font-weight:700;color:{txt}">{label}</div>'
+                     f'<div style="font-size:9px;color:{txt};opacity:0.8">{sub}</div>'
+                     f'{"<div style=\"font-size:8px;color:#f85149\">BLOCK</div>" if is_blocked else ""}'
+                     f'</div>')
+    return f'<div style="display:flex;flex-wrap:wrap;gap:3px;margin-top:2px">{"".join(cells)}</div>'
+
 def build_settings_page(user=None, msg=""):
     conn = db_connect()
     settings = dict(conn.execute("SELECT key, value FROM settings").fetchall())
     accts  = conn.execute("SELECT coin, capital, wins, losses, total_pnl FROM paper_accounts").fetchall()
     rs_row = conn.execute("SELECT kill_switch, daily_loss_limit, max_drawdown_pct, max_stake, cooldown_after_losses FROM risk_settings WHERE id=1").fetchone()
+    # Hour WR data for blackout display
+    hour_wr = {}
+    rows = conn.execute("""
+        SELECT CAST(strftime('%H', datetime(window_ts,'unixepoch','-5 hours')) AS INTEGER) hr,
+               COUNT(*) total,
+               SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) wins
+        FROM paper_trades WHERE result IN ('WIN','LOSS')
+        GROUP BY hr ORDER BY hr
+    """).fetchall()
+    for hr, total, wins in rows:
+        hour_wr[hr] = (wins / total, total) if total > 0 else (0, 0)
     conn.close()
 
     rs = {"kill_switch": bool(rs_row[0]), "daily_loss_limit": rs_row[1],
@@ -4119,7 +4155,20 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Max Stake ($) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_stake" value="{rs['max_stake']:.0f}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Cooldown After N Losses {tooltip_html("cooldown_after_losses")}</span><input type="number" name="cooldown_after_losses" value="{rs['cooldown_after_losses']}" step="1" min="0" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Min Volume (contracts) {tooltip_html("min_volume")}</span><input type="number" name="min_volume" value="{settings.get('min_volume', 500)}" step="50" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Skip windows below this 24h volume. 0 = disabled.</span></div>
-<div class="form-row"><span class="form-label">Blackout Hours (CT)</span><input type="text" name="blackout_hours" value="{settings.get('blackout_hours', '8,10,11,17,18,23')}" style="width:200px" placeholder="e.g. 8,10,11,17"><span style="color:#8b949e;font-size:11px;margin-left:8px">Skip trading during these hours (CT, 0-23). Comma-separated. Based on your hour WR data.</span></div>
+<div class="form-row" style="align-items:flex-start;flex-wrap:wrap;gap:8px">
+  <span class="form-label" style="padding-top:6px">Blackout Hours (CT)</span>
+  <div>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <input type="text" name="blackout_hours" value="{settings.get('blackout_hours', '8,10,11,17,18,23')}" style="width:200px" placeholder="e.g. 8,10,11,17">
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:#8b949e;cursor:pointer">
+        <input type="checkbox" name="blackout_auto" value="1" {'checked' if settings.get('blackout_auto','1') != '0' else ''}>
+        auto-adjust
+      </label>
+    </div>
+    <div style="font-size:10px;color:#8b949e;margin-bottom:6px">Auto-adjust: blocks hours with WR &lt;{BLACKOUT_BLOCK_WR:.0%}, unblocks hours with WR ≥{BLACKOUT_UNBLOCK_WR:.0%} (min {BLACKOUT_MIN_TRADES} trades). Recalculates every 2h.</div>
+    {_blackout_hour_grid(hour_wr, settings.get('blackout_hours','8,10,11,17,18,23'))}
+  </div>
+</div>
 <div class="form-row"><span class="form-label">Auto-Pause WR Threshold</span><input type="number" name="autopause_wr_threshold" value="{settings.get('autopause_wr_threshold', 0.42)}" step="0.01" min="0" max="1" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Pause coin if rolling WR (last 15 trades) falls below this. 0 = disabled. Suggested: 0.42</span></div>
 <div class="form-row"><span class="form-label">Tracked Polymarket Wallets</span><input type="text" name="poly_tracked_wallets" value="{settings.get('poly_tracked_wallets', '')}" style="width:420px" placeholder="0xABC123...,0xDEF456... (comma-separated)"><span style="color:#8b949e;font-size:11px;margin-left:8px">Wallet addresses to copy-trade. Their recent buys/sells are shown to the LLM as smart money signals.</span></div>
 <div style="margin-top:16px;padding-top:14px;border-top:1px solid #21262d">
@@ -5039,6 +5088,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                   ("exit_llm_check",       params.get("exit_llm_check", "1")),
                                   ("pool_multi_threshold", float(params.get("pool_multi_threshold", 0))),
                                   ("blackout_hours",       params.get("blackout_hours", "8,10,11,17,18,23")),
+                                  ("blackout_auto",        "1" if params.get("blackout_auto") else "0"),
                                   ("autopause_wr_threshold", float(params.get("autopause_wr_threshold", 0.42))),
                                   ("poly_tracked_wallets", params.get("poly_tracked_wallets", ""))]:
                 conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
@@ -5626,6 +5676,72 @@ def import_betbot_data():
     print(f"[IMPORT] {msg}")
     return msg
 
+# ── Dynamic blackout recalculation ──────────────────────────────────────────────
+BLACKOUT_MIN_TRADES  = 12   # need at least this many trades in an hour before acting
+BLACKOUT_BLOCK_WR    = 0.44 # WR below this → add to blackout
+BLACKOUT_UNBLOCK_WR  = 0.52 # WR above this → remove from blackout
+
+def recalc_blackout_hours():
+    """Recompute blackout hours from paper trade WR by CT hour.
+    Only adjusts hours with >= BLACKOUT_MIN_TRADES data points.
+    Blocked when WR < BLACKOUT_BLOCK_WR, unblocked when WR >= BLACKOUT_UNBLOCK_WR.
+    """
+    try:
+        conn = db_connect()
+        # Check if auto-blackout is enabled (default on)
+        auto_row = conn.execute("SELECT value FROM settings WHERE key='blackout_auto'").fetchone()
+        if auto_row and auto_row[0] == "0":
+            conn.close()
+            return
+
+        rows = conn.execute("""
+            SELECT
+              CAST(strftime('%H', datetime(window_ts, 'unixepoch', '-5 hours')) AS INTEGER) AS hr,
+              COUNT(*) AS total,
+              SUM(CASE WHEN result='WIN' THEN 1 ELSE 0 END) AS wins
+            FROM paper_trades
+            WHERE result IN ('WIN','LOSS')
+            GROUP BY hr
+        """).fetchall()
+
+        if not rows:
+            conn.close()
+            return
+
+        # Current blackout list
+        bh_row = conn.execute("SELECT value FROM settings WHERE key='blackout_hours'").fetchone()
+        current = set(int(h.strip()) for h in (bh_row[0] if bh_row else "").split(",") if h.strip().isdigit())
+
+        changes = []
+        for hr, total, wins in rows:
+            if total < BLACKOUT_MIN_TRADES:
+                continue
+            wr = wins / total
+            if wr < BLACKOUT_BLOCK_WR and hr not in current:
+                current.add(hr)
+                changes.append(f"+{hr:02d}:00 WR={wr:.0%}({total}t)")
+            elif wr >= BLACKOUT_UNBLOCK_WR and hr in current:
+                current.discard(hr)
+                changes.append(f"-{hr:02d}:00 WR={wr:.0%}({total}t)")
+
+        new_val = ",".join(str(h) for h in sorted(current))
+        conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('blackout_hours',?,?)",
+                     (new_val, now_cst().isoformat()))
+        conn.commit()
+        conn.close()
+        if changes:
+            print(f"[BLACKOUT] Auto-adjusted: {', '.join(changes)} → hours now: {new_val}")
+        else:
+            print(f"[BLACKOUT] No changes — hours: {new_val}")
+    except Exception as e:
+        print(f"[BLACKOUT] recalc error: {e}")
+
+def blackout_recalc_loop():
+    time.sleep(60)  # wait for startup
+    while True:
+        recalc_blackout_hours()
+        time.sleep(7200)  # recalc every 2 hours
+
 # ── Main ────────────────────────────────────────────────────────────────────────
 def main():
     print("[AUTOBET] Starting up v2...")
@@ -5639,6 +5755,7 @@ def main():
         threading.Thread(target=collect_polymarket,    daemon=True, name="polymarket"),
         threading.Thread(target=decision_loop,         daemon=True, name="decisions"),
         threading.Thread(target=live_order_sync_loop,  daemon=True, name="live_sync"),
+        threading.Thread(target=blackout_recalc_loop,  daemon=True, name="blackout_recalc"),
     ]
     for t in threads:
         t.start()
