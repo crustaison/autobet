@@ -1,6 +1,6 @@
 # autobet
 
-Multi-venue prediction market trading platform. Trades Kalshi 15-minute crypto contracts across BTC, XRP, SOL, ETH, DOGE, BNB, HYPE. Supports paper and live trading with dual-LLM decision making, per-coin engine selection, Kelly-criterion sizing, smart money copy-trading, early exit engine, and full audit trail.
+Multi-venue prediction market trading platform. Trades Kalshi 15-minute crypto contracts across BTC, XRP, SOL, ETH, DOGE, BNB, HYPE. Supports paper and live trading with dual-LLM decision making (MiniMax M2.5 primary + adversarial skeptic), per-coin engine selection, Kelly-criterion sizing, smart money copy-trading, early exit engine, and full audit trail.
 
 **Dashboard:** http://ryz.local:7778
 
@@ -58,13 +58,29 @@ cd ~/autobet && nohup python3 -u autobet_main.py >> autobet.log 2>&1 &
 
 | Engine | Description |
 |---|---|
-| **minimax_llm** | Dual-LLM: MiniMax M2.1 + local Qwen3.5-35B run in parallel. Results reconciled — agreement boosts confidence 8%, disagreement penalizes 35%. All sub-engines feed context into the prompt. |
+| **minimax_llm** | Dual-LLM: two parallel MiniMax M2.5 calls — primary synthesizer + adversarial skeptic. Results reconciled — agreement boosts confidence 8%, disagreement penalizes 35%. All sub-engines feed context into both prompts. ~3-5s per call. |
 | **rules_engine** | Kalshi mid > 0.62 → YES, mid < 0.38 → NO, else PASS. Zero API calls. |
 | **vector_knn** | 8-feature cosine similarity against resolved historical windows (needs 20+ resolved trades). |
 | **hybrid** | Rules gate first, then KNN confidence boost if same direction. |
 | **betbot_signal** | Reads `~/autoresearch/data/kalshi_signals*.json` written by betbot's autoresearch loop. |
 
 Engine is configurable per-coin from the Markets page. Default: `minimax_llm`.
+
+### Dual MiniMax M2.5 Architecture
+
+Two independent MiniMax M2.5 calls run in parallel every decision window:
+
+| Call | Role | Temperature | Framing |
+|---|---|---|---|
+| **Primary** | Synthesize all signals into a decision | Default | "You are the final decision-maker — synthesize all signals" |
+| **Skeptic** | Challenge the consensus | 0.4 | "Assume the obvious direction is wrong — find the counter-argument" |
+
+**Reconciliation:**
+- Both agree → confidence boosted: `(avg_conf × 1.08)`, rationale tagged `[skeptic agrees ↑]`
+- Disagree → confidence penalized: `primary_conf × 0.65`, rationale tagged `[skeptic disagrees ↓]`
+- One fails/times out → other's result used alone
+
+Previously used a local Qwen3.5-35B-A3B subprocess as the second LLM (3.5 tok/s, ~20s, semaphore-limited to 1 concurrent). Replaced with second MiniMax call: ~4x faster, no hardware bottleneck, no semaphore needed.
 
 ### What the LLM sees per window
 
@@ -253,6 +269,29 @@ Configurable from the Settings page:
 ```bash
 python3 -c "import ast; ast.parse(open('autobet_main.py').read()); print('OK')"
 ```
+
+---
+
+## Host Machine — ryz.local
+
+**Hardware:** AMD Ryzen 9 6900HX (16 threads, 4.9GHz boost), 60GB RAM, Radeon 680M iGPU (3GB VRAM shared), x86_64
+
+**Nexa SDK:** v0.2.73 at `/opt/nexa_sdk/`, served on port 18181 (for embeddings/small models)
+
+**Performance tuning applied (reapply after reboot):**
+
+```bash
+# Transparent hugepages — reduces TLB pressure on large model files
+echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+echo always | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+
+# Pin 35B model file in RAM page cache (19GB — eliminates cold-load disk I/O)
+vmtouch -t ~/.cache/nexa.ai/nexa_sdk/models/unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_M.gguf
+```
+
+CPU governor is permanently set to `performance` via systemd. Swap is 15GB but swappiness=10 so RAM is preferred.
+
+**Local model benchmarks (Qwen3.5-35B-A3B Q4_K_M, warm):** 3.5 tok/s — hardware ceiling for a 19GB model on 16-thread CPU with no GPU offload. This is why the dual-LLM was switched to two MiniMax M2.5 API calls instead.
 
 ## Win Rate by Hour (CT) — basis for default blackout hours
 
