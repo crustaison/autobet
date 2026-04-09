@@ -550,7 +550,7 @@ def live_order_sync_loop():
 _ob_cache = {}   # ticker -> (fetched_ts, orderbook_fp dict)
 _ob_lock  = threading.Lock()
 _pool_last_placed_wts = 0   # prevents duplicate pool orders in the same window
-_local_llm_sem = threading.Semaphore(1)  # only one 35B subprocess at a time
+# (local LLM semaphore removed — dual MiniMax replaces local 35B subprocess)
 
 def fetch_orderbook(ticker):
     """Return orderbook_fp dict for ticker, cached 45s. Returns None on error."""
@@ -1633,19 +1633,71 @@ Respond with JSON only:
         except Exception as e:
             print(f"[MINIMAX] {coin}: {e}")
 
+    def _call_minimax2():
+        """Second independent MiniMax call — adversarial framing, higher temperature."""
+        try:
+            adversarial_prompt = (
+                prompt.replace(
+                    "Synthesize all available signals and make the final trading decision.",
+                    "You are a SKEPTIC. Your job is to challenge the consensus. Assume the obvious direction is wrong — what would make you go the OTHER way? Only go with the consensus if you cannot find a compelling counter-argument."
+                )
+            )
+            payload = json.dumps({
+                "model": get_minimax_model(),
+                "max_tokens": 4096,
+                "temperature": 0.4,
+                "messages": [{"role": "user", "content": adversarial_prompt}]
+            }).encode()
+            req = urllib.request.Request(
+                MINIMAX_URL, data=payload,
+                headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as r:
+                resp = json.loads(r.read().decode())
+                text = ""
+                for block in resp.get("content", []):
+                    if block.get("type") == "text":
+                        text = block.get("text", "").strip()
+                        break
+                if not text:
+                    return
+                if "```" in text:
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                text = text.strip()
+                try:
+                    results["minimax2"] = json.loads(text)
+                except Exception:
+                    import re as _re2
+                    dir_m  = _re2.search(r'"direction"\s*:\s*"(YES|NO)"', text)
+                    ent_m  = _re2.search(r'"entry"\s*:\s*([0-9.]+)', text)
+                    conf_m = _re2.search(r'"confidence"\s*:\s*([0-9.]+)', text)
+                    rat_m  = _re2.search(r'"rationale"\s*:\s*"([^"]*)', text)
+                    if dir_m and ent_m:
+                        results["minimax2"] = {
+                            "direction":  dir_m.group(1),
+                            "entry":      float(ent_m.group(1)),
+                            "confidence": float(conf_m.group(1)) if conf_m else 0.5,
+                            "rationale":  rat_m.group(1)[:80] if rat_m else "parsed",
+                            "suggest_engine": None,
+                        }
+        except Exception as e:
+            print(f"[MINIMAX2] {coin}: {e}")
+
     t_mm  = _threading.Thread(target=_call_minimax,  daemon=True)
-    t_loc = _threading.Thread(target=lambda: results.update({"local": local_llm_analyze(coin, prompt)}), daemon=True)
+    t_loc = _threading.Thread(target=_call_minimax2, daemon=True)
     t_mm.start()
     t_loc.start()
     t_mm.join(timeout=125)
-    t_loc.join(timeout=95)
+    t_loc.join(timeout=125)
 
     mm = results.get("minimax")
-    lo = results.get("local")
+    lo = results.get("minimax2")
 
     # Treat PASS direction as no-signal (model expressing uncertainty via direction field)
     if mm and mm.get("direction") not in ("YES", "NO"):
-        print(f"[DUAL LLM] {coin}: MiniMax returned direction={mm.get('direction')} — treating as no signal")
+        print(f"[DUAL LLM] {coin}: MiniMax#1 returned direction={mm.get('direction')} — treating as no signal")
         mm = None
     if lo and lo.get("direction") not in ("YES", "NO"):
         lo = None
@@ -1654,24 +1706,22 @@ Respond with JSON only:
         mm_dir, lo_dir = mm.get("direction"), lo.get("direction")
         mm_conf, lo_conf = float(mm.get("confidence", 0.5)), float(lo.get("confidence", 0.5))
         if mm_dir == lo_dir:
-            # Both agree — boost confidence slightly, note in rationale
             boosted = round(min((mm_conf + lo_conf) / 2 * 1.08, 0.95), 4)
             mm["confidence"] = boosted
-            mm["rationale"]  = mm["rationale"].rstrip(".") + f" [local agrees {lo_conf:.2f}↑]"
-            print(f"[DUAL LLM] {coin}: AGREE {mm_dir} mm={mm_conf:.2f} local={lo_conf:.2f} → {boosted:.2f}")
+            mm["rationale"]  = mm["rationale"].rstrip(".") + f" [skeptic agrees {lo_conf:.2f}↑]"
+            print(f"[DUAL LLM] {coin}: AGREE {mm_dir} mm={mm_conf:.2f} skeptic={lo_conf:.2f} → {boosted:.2f}")
         else:
-            # Disagree — penalize confidence, flag in rationale
             penalized = round(mm_conf * 0.65, 4)
             mm["confidence"] = penalized
-            mm["rationale"]  = mm["rationale"].rstrip(".") + f" [local disagrees: {lo_dir} {lo_conf:.2f}↓]"
-            print(f"[DUAL LLM] {coin}: DISAGREE mm={mm_dir}({mm_conf:.2f}) local={lo_dir}({lo_conf:.2f}) → penalized to {penalized:.2f}")
+            mm["rationale"]  = mm["rationale"].rstrip(".") + f" [skeptic disagrees: {lo_dir} {lo_conf:.2f}↓]"
+            print(f"[DUAL LLM] {coin}: DISAGREE mm={mm_dir}({mm_conf:.2f}) skeptic={lo_dir}({lo_conf:.2f}) → penalized to {penalized:.2f}")
         result = mm
     elif mm:
-        print(f"[DUAL LLM] {coin}: MiniMax only (local timed out)")
+        print(f"[DUAL LLM] {coin}: primary only (skeptic timed out)")
         result = mm
     elif lo:
-        print(f"[DUAL LLM] {coin}: local only (MiniMax failed)")
-        lo["rationale"] = lo.get("rationale","").rstrip(".") + " [local only]"
+        print(f"[DUAL LLM] {coin}: skeptic only (primary failed)")
+        lo["rationale"] = lo.get("rationale","").rstrip(".") + " [skeptic only]"
         result = lo
     else:
         return None
@@ -1680,45 +1730,6 @@ Respond with JSON only:
     if sug and sug in ("rules_engine", "vector_knn", "hybrid", "minimax_llm"):
         print(f"[ENGINE HINT] {coin}: LLM suggests switching to {sug} — {result.get('rationale','')[:60]}")
     return result
-
-def local_llm_analyze(coin, prompt):
-    """
-    Local Qwen3.5-35B-A3B via nexa infer subprocess.
-    Serialized via semaphore — only one instance runs at a time since the
-    35B subprocess loads 20GB each call and cannot handle parallel invocations.
-    """
-    if not _local_llm_sem.acquire(blocking=True, timeout=5):
-        # Another coin already has the model loaded — skip rather than queue
-        print(f"[LOCAL LLM] {coin}: skipped (another call in progress)")
-        return None
-    try:
-        import subprocess as _sp, re as _re
-        nexa_cli = "/opt/nexa_sdk/nexa-cli"
-        model    = "unsloth/Qwen3.5-35B-A3B-GGUF:Q4_K_M"
-        local_prompt = "/no_think\n\n" + prompt
-        t0 = time.time()
-        result = _sp.run(
-            [nexa_cli, "infer", model,
-             "--max-tokens", "300", "--hide-think",
-             "-p", local_prompt],
-            capture_output=True, text=True, timeout=75
-        )
-        elapsed = time.time() - t0
-        raw = _re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]|\r', '', result.stdout + result.stderr)
-        for m in _re.finditer(r'\{[^{}]+\}', raw, _re.DOTALL):
-            try:
-                parsed = json.loads(m.group())
-                if parsed.get("direction") in ("YES", "NO") and parsed.get("entry"):
-                    print(f"[LOCAL LLM] {coin}: {parsed['direction']} @ {parsed['entry']} conf={parsed.get('confidence',0):.2f} ({elapsed:.1f}s)")
-                    return parsed
-            except Exception:
-                pass
-        print(f"[LOCAL LLM] {coin}: no valid JSON ({elapsed:.1f}s)")
-    except Exception as le:
-        print(f"[LOCAL LLM] {coin}: {le}")
-    finally:
-        _local_llm_sem.release()
-    return None
 
 def format_ticks_summary(ticks):
     if not ticks:
