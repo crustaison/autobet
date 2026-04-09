@@ -3368,6 +3368,29 @@ def build_dashboard(user=None):
             (coin, recent_cutoff)
         ).fetchone()
         coin_last_order[coin] = row
+    # Live order actual W/L per coin (filled + resolved, not paper)
+    live_wl = {}
+    for coin in COINS:
+        r = conn.execute("""
+            SELECT
+              SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END),
+              SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END),
+              COALESCE(SUM(pnl), 0)
+            FROM live_orders
+            WHERE coin=? AND status IN ('filled','executed','filled_partial')
+              AND resolved_at IS NOT NULL
+        """, (coin,)).fetchone()
+        if r and (r[0] or r[1]):
+            live_wl[coin] = (int(r[0] or 0), int(r[1] or 0), float(r[2] or 0))
+    # Recent live order history per coin (activity log style, last 5)
+    coin_live_history = {}
+    for coin in COINS:
+        rows = conn.execute("""
+            SELECT direction, contracts, avg_fill_price, status, pnl, window_ts
+            FROM live_orders WHERE coin=?
+            ORDER BY id DESC LIMIT 5
+        """, (coin,)).fetchall()
+        coin_live_history[coin] = rows
     # Pool: last winner this session
     pool_last = conn.execute(
         "SELECT coin, direction, contracts, status, window_ts FROM live_orders ORDER BY id DESC LIMIT 1"
@@ -3406,9 +3429,15 @@ def build_dashboard(user=None):
         price_str = (f"${price:,.4f}" if price and price < 10 else f"${price:,.2f}") if price else "---"
         acct   = accts.get(coin)
         capital    = acct[1] if acct else STARTING_CAPITAL
-        wins       = acct[2] if acct else 0
-        losses     = acct[3] if acct else 0
-        total_pnl  = acct[4] if acct else 0
+        coin_is_live_mode = live_on and coin_modes_db.get(coin) == "live"
+        lw = live_wl.get(coin) if coin_is_live_mode else None
+        if lw:
+            # Live mode: show actual filled+settled order outcomes
+            wins, losses, total_pnl = lw
+        else:
+            wins      = acct[2] if acct else 0
+            losses    = acct[3] if acct else 0
+            total_pnl = acct[4] if acct else 0
         total_trades = wins + losses
         win_rate   = f"{wins/total_trades*100:.0f}%" if total_trades > 0 else "—"
         pnl_cls    = "green" if total_pnl >= 0 else "red"
@@ -3434,61 +3463,80 @@ def build_dashboard(user=None):
             ev_html = f'<div style="margin:5px 0 2px 0"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:10px;color:#8b949e">Edge</span><div style="flex:1;height:4px;background:#21262d;border-radius:2px"><div style="width:{ev_bar_w:.0f}%;height:100%;background:{ev_bar_col};border-radius:2px"></div></div><span style="font-size:10px;font-weight:700" class="{ev_cls}">EV {ev_val:+.3f}</span>{tooltip_html("edge")}</div></div>'
         else:
             ev_html = '<div style="margin:5px 0 2px 0;font-size:10px;color:#555">Edge — no data yet</div>'
-        # Live fill indicator
-        coin_is_live = live_on and coin_modes_db.get(coin) == "live"
+        # Live activity log (Kalshi-style)
         last_order = coin_last_order.get(coin)
-        if coin_is_live:
+        if coin_is_live_mode:
+            hist = coin_live_history.get(coin, [])
+            # Check for active position this window
+            active_html = ""
             if last_order:
                 lo_dir, lo_contracts, lo_status, lo_error, lo_time, lo_wts, lo_avg_price, lo_filled = last_order
-                lo_color = {"placed": "#e3b341", "filled": "#3fb950", "failed": "#f85149", "canceled": "#8b949e", "executed": "#3fb950", "filled_partial": "#e3b341"}.get(lo_status, "#8b949e")
-                lo_icon  = {"placed": "⏳", "filled": "✓", "failed": "✗", "canceled": "–", "executed": "✓", "filled_partial": "~"}.get(lo_status, "?")
-                lo_label = f'{lo_icon} {lo_status}'
-                if lo_status == "failed" and lo_error:
-                    short_err = lo_error.replace("HTTP 401: ", "").replace('{"error":{"code":"authentication_error","message":"authentication_error","details":"', "").rstrip('"}')[:30]
-                    lo_label += f' — {short_err}'
-
-                # Active position block — show unrealized P&L and market movement
                 is_active = (lo_wts == wts and lo_status in ("filled", "executed", "filled_partial")
                              and lo_filled and lo_avg_price)
                 if is_active and yes_bid and yes_ask:
                     n = int(lo_filled or 0)
                     avg_p = float(lo_avg_price or 0)
-                    # Current value and unrealized P&L
                     if lo_dir == "NO":
-                        cur_val = 1.0 - yes_bid          # what NO is worth now
+                        cur_val = 1.0 - yes_bid
                         unreal  = n * (cur_val - avg_p)
                     else:
                         cur_val = yes_bid
                         unreal  = n * (cur_val - avg_p)
                     unreal_color = "#3fb950" if unreal >= 0 else "#f85149"
                     unreal_s = f'+${unreal:.2f}' if unreal >= 0 else f'-${abs(unreal):.2f}'
-                    # Time progress bar (window is 900s)
                     elapsed_pct = min(100, max(0, (900 - secs_left) / 900 * 100))
                     bar_color = "#3fb950" if unreal >= 0 else "#f85149"
                     entry_s = f"{avg_p*100:.0f}¢"
                     cur_s   = f"{cur_val*100:.0f}¢"
-                    live_indicator = f'''<div style="margin-top:6px;padding:6px 10px;border-radius:6px;background:#0d1117;border:1px solid {lo_color}" onclick="event.stopPropagation();window.location='/fill-quality'">
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">
-    <span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>
-    <span style="font-size:11px;color:{lo_color};font-weight:700">{lo_dir}</span>
+                    active_html = f'''<div style="margin-bottom:4px;padding:5px 8px;border-radius:5px;background:#0d1117;border:1px solid {unreal_color}">
+  <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+    <span style="font-size:9px;background:{unreal_color};color:#000;padding:1px 5px;border-radius:3px;font-weight:700">LIVE</span>
+    <span style="font-size:11px;color:#e6edf3;font-weight:700">{lo_dir}</span>
     <span style="font-size:10px;color:#8b949e">{n}c @ {entry_s}</span>
-    <span style="font-size:10px;color:#8b949e">→</span>
-    <span style="font-size:11px;font-weight:700;color:{unreal_color}">{cur_s}</span>
-    <span style="font-size:11px;font-weight:700;color:{unreal_color};margin-left:auto">{unreal_s}</span>
+    <span style="font-size:11px;color:#8b949e">→</span>
+    <span style="font-size:11px;color:{unreal_color};font-weight:700">{cur_s}</span>
+    <span style="font-size:11px;color:{unreal_color};font-weight:700;margin-left:auto">{unreal_s}</span>
   </div>
-  <div style="height:3px;background:#21262d;border-radius:2px">
-    <div style="width:{elapsed_pct:.0f}%;height:100%;background:{bar_color};border-radius:2px;transition:width 1s"></div>
+  <div style="height:2px;background:#21262d;border-radius:2px">
+    <div style="width:{elapsed_pct:.0f}%;height:100%;background:{bar_color};border-radius:2px"></div>
   </div>
   <div style="display:flex;justify-content:space-between;margin-top:2px">
     <span style="font-size:9px;color:#555">{900-secs_left:.0f}s elapsed</span>
     <span style="font-size:9px;color:#555">{secs_left}s left</span>
   </div>
 </div>'''
+            # Activity log rows
+            rows_html = ""
+            for h_dir, h_contracts, h_avg_price, h_status, h_pnl, h_wts in hist:
+                h_time_s = ts_cst(h_wts).strftime("%H:%M") if h_wts else "—"
+                if h_status == "canceled":
+                    row_color = "#8b949e"
+                    result_s  = "canceled"
+                    pnl_s     = ""
+                elif h_pnl is not None and h_status in ("filled", "executed", "filled_partial"):
+                    if h_pnl > 0:
+                        row_color = "#3fb950"
+                        result_s  = "WIN"
+                        pnl_s     = f'<span style="color:#3fb950;font-weight:700;margin-left:auto">+${h_pnl:.2f}</span>'
+                    else:
+                        row_color = "#f85149"
+                        result_s  = "LOSS"
+                        pnl_s     = f'<span style="color:#f85149;font-weight:700;margin-left:auto">-${abs(h_pnl):.2f}</span>'
                 else:
-                    live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid {lo_color};display:flex;align-items:center;gap:6px" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
-                                     f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
-                                     f'<span style="font-size:11px;color:{lo_color};font-weight:600">{lo_label}</span>' \
-                                     f'<span style="font-size:10px;color:#555;margin-left:auto">{lo_contracts}c</span></div>'
+                    row_color = "#e3b341"
+                    result_s  = h_status
+                    pnl_s     = ""
+                entry_disp = f"{float(h_avg_price)*100:.0f}¢" if h_avg_price else "—"
+                rows_html += f'<div style="display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px solid #21262d">' \
+                             f'<span style="font-size:9px;color:#555;min-width:30px">{h_time_s}</span>' \
+                             f'<span style="font-size:10px;color:#e6edf3;font-weight:600;min-width:24px">{h_dir}</span>' \
+                             f'<span style="font-size:10px;color:#8b949e">{h_contracts}c @ {entry_disp}</span>' \
+                             f'<span style="font-size:10px;color:{row_color};margin-left:4px">{result_s}</span>' \
+                             f'{pnl_s}</div>'
+            if rows_html or active_html:
+                live_indicator = f'<div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:#0d1117;border:1px solid #30363d" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
+                                 f'<div style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">LIVE ORDERS</div>' \
+                                 f'{active_html}{rows_html}</div>'
             else:
                 live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid #30363d;display:flex;align-items:center;gap:6px">' \
                                  f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
@@ -3500,7 +3548,7 @@ def build_dashboard(user=None):
   <div class="card-header">
     <div class="coin-badge" style="background:{color}">{letter}</div>
     <div><div class="coin-name">{coin}</div><div class="mkt-ticker" style="font-size:10px">{ticker}</div></div>
-    <div style="margin-left:auto;text-align:right"><div class="price" style="font-size:15px;color:{'#3fb950' if total_pnl>=0 else '#f85149'}">${(pool_balance if (pool_on and coin_is_live and pool_balance is not None) else capital):.2f}</div><div style="font-size:10px;color:#8b949e">{'pool' if (pool_on and coin_is_live and pool_balance is not None) else price_str}</div></div>
+    <div style="margin-left:auto;text-align:right"><div class="price" style="font-size:15px;color:{'#3fb950' if total_pnl>=0 else '#f85149'}">${(pool_balance if (pool_on and coin_is_live_mode and pool_balance is not None) else capital):.2f}</div><div style="font-size:10px;color:#8b949e">{'pool' if (pool_on and coin_is_live_mode and pool_balance is not None) else price_str}</div></div>
   </div>
   <div class="stat-row"><span class="stat-label">Kalshi Bid/Ask</span><span class="stat-value">{yes_bid:.3f} / {yes_ask:.3f}</span></div>
   <div style="margin:4px 0 2px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:10px;color:#8b949e;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
@@ -3525,7 +3573,7 @@ def build_dashboard(user=None):
                 sc = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e", "executed": "#3fb950"}.get(ostatus, "#8b949e")
                 proj = ""
                 try:
-                    if olimit_price and ocontracts:
+                    if ostatus not in ("canceled", "failed") and olimit_price and ocontracts:
                         ep = float(olimit_price) / 100.0
                         gross = ocontracts * (1.0 - ep)
                         fee = min(KALSHI_FEE_RATE * ep * (1.0 - ep), 0.02) * ocontracts
