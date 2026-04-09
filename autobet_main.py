@@ -319,9 +319,32 @@ def check_exit_positions():
 
             reason = None
 
-            # Rule 1: Take profit
-            if unreal_pct >= take_profit_pct:
-                reason = f"take_profit ({unreal_pct:+.0f}% >= {take_profit_pct:.0f}%)"
+            # Rule 1: Trailing stop — track peak unrealized P&L, exit if fallen X% from peak
+            peak_key = f"trailing_peak_{lo_id}"
+            try:
+                conn_tp = db_connect()
+                peak_row = conn_tp.execute(
+                    "SELECT value FROM settings WHERE key=?", (peak_key,)
+                ).fetchone()
+                peak_pct = float(peak_row[0]) if peak_row else unreal_pct
+                if unreal_pct > peak_pct:
+                    peak_pct = unreal_pct
+                    conn_tp.execute(
+                        "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                        (peak_key, str(peak_pct), now_cst().isoformat())
+                    )
+                    conn_tp.commit()
+                conn_tp.close()
+            except Exception:
+                peak_pct = unreal_pct
+
+            # Trailing stop: if was up >= take_profit_pct and has fallen > 15% from peak, exit
+            trail_drop = peak_pct - unreal_pct
+            if peak_pct >= take_profit_pct and trail_drop >= 15.0:
+                reason = f"trailing_stop (peak {peak_pct:+.0f}% → now {unreal_pct:+.0f}%, dropped {trail_drop:.0f}%)"
+            elif unreal_pct >= take_profit_pct and secs_left <= 120:
+                # Lock in profit in last 2 minutes if at target
+                reason = f"take_profit_lock ({unreal_pct:+.0f}% >= {take_profit_pct:.0f}%, {secs_left}s left)"
 
             # Rule 2: Stop loss
             elif unreal_pct <= -stop_loss_pct:
@@ -561,6 +584,47 @@ def get_available_contracts(ticker, direction, entry):
         except (ValueError, TypeError):
             continue
     return available, True
+
+def fetch_kalshi_comments(ticker, coin):
+    """Fetch recent market comments from Kalshi and cache in _kalshi_comments."""
+    try:
+        data = kalshi_get(f"/markets/{ticker}/comments?limit=20")
+        if not data:
+            return
+        comments = data.get("comments", [])
+        snippets = []
+        for c in comments:
+            text = (c.get("content") or c.get("body") or "").strip()
+            if text and len(text) > 5:
+                snippets.append(text[:120])
+        with _state_lock:
+            _kalshi_comments[coin] = snippets[:10]
+    except Exception:
+        pass
+
+def fetch_kalshi_order_book(ticker):
+    """Return a human-readable order book depth summary for the LLM prompt."""
+    try:
+        ob = fetch_orderbook(ticker)
+        if not ob:
+            return None
+        yes_levels = ob.get("yes_dollars", [])
+        no_levels  = ob.get("no_dollars", [])
+        # Top 3 YES asks and NO asks (sorted by price ascending = cheapest first)
+        def top3(levels):
+            try:
+                srt = sorted(levels, key=lambda x: float(x[0]))[:3]
+                return " | ".join(f"{float(p):.2f}x{float(q):.0f}" for p, q in srt)
+            except Exception:
+                return "n/a"
+        yes_str = top3(yes_levels)
+        no_str  = top3(no_levels)
+        total_yes = sum(float(q) for _, q in yes_levels) if yes_levels else 0
+        total_no  = sum(float(q) for _, q in no_levels) if no_levels else 0
+        return (f"Order book depth: YES ask ladder (price×qty): {yes_str}  total={total_yes:.0f}c | "
+                f"NO ask ladder: {no_str}  total={total_no:.0f}c")
+    except Exception:
+        return None
 
 # ── Database ────────────────────────────────────────────────────────────────────
 def db_connect():
@@ -813,7 +877,11 @@ def db_init():
     # Seed default filter settings (won't overwrite existing values)
     for k, v in [("min_confidence", "0.55"), ("min_volume", "500"),
                  ("exit_take_profit_pct", "40"), ("exit_stop_loss_pct", "65"),
-                 ("exit_time_cliff_secs", "90"), ("exit_llm_check", "1")]:
+                 ("exit_time_cliff_secs", "90"), ("exit_llm_check", "1"),
+                 ("pool_multi_threshold", "0"),
+                 ("blackout_hours", "8,10,11,17,18,23"),
+                 ("autopause_wr_threshold", "0.42"),
+                 ("poly_tracked_wallets", "")]:
         conn.execute("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                      (k, v, now_cst().isoformat()))
 
@@ -931,6 +999,8 @@ _prices        = {}
 _active_mkts   = {}
 _last_collect  = {}
 _poly_mkts     = {}   # coin -> latest polymarket data
+_poly_wallets  = {}   # wallet_addr -> {coin, direction, size, ts} — copy-trading signals
+_kalshi_comments = {}  # coin -> list of recent comment strings
 _health_status = {}   # key -> {ok, msg, ts}
 
 # ── Price collection ────────────────────────────────────────────────────────────
@@ -1037,6 +1107,9 @@ def collect_kalshi():
                     """, (coin, wts, m["ticker"], m["yes_bid"], m["yes_ask"],
                           m["last_price"], secs_left, _prices.get(coin), ts))
                     ok_count += 1
+                    # Fetch comments every ~5 minutes (every 5th collect cycle)
+                    if ts % 300 < 65:
+                        fetch_kalshi_comments(m["ticker"], coin)
                     time.sleep(0.5)
                 except Exception as e:
                     print(f"[KALSHI] {coin}: {e}")
@@ -1050,6 +1123,127 @@ def collect_kalshi():
             with _state_lock:
                 _health_status["kalshi"] = {"ok": False, "msg": str(e), "ts": int(time.time())}
         time.sleep(60)
+
+# ── Polymarket copy-trading wallet discovery ────────────────────────────────────
+POLY_COPY_SEED = [
+    "0xdE17f7144fbD0eddb2679132C10ff5e74B120988",  # #1 leaderboard +$723k
+    "0xB27BC932bf8110D8F78e55da7d5f0497A18B5b82",  # #5 +$412k
+    "0x1f0ebc543B2d411f66947041625c0Aa1ce61CF86",  # #7 +$379k
+    "0xd1ebE815f921b3EbBD8d9e0a4192C6Ab18360F5c",  # #12 +$225k
+]
+POLY_CRYPTO_KWS = ["bitcoin","btc","ethereum","eth","solana","sol","xrp","ripple","doge","bnb","hype"]
+_last_wallet_discover = 0   # epoch timestamp of last leaderboard scrape
+
+def _discover_poly_wallets():
+    """Scrape Polymarket crypto leaderboard, test each wallet for activity, save top ones."""
+    global _last_wallet_discover
+    import re as _re2
+    try:
+        req = urllib.request.Request(
+            "https://polymarket.com/leaderboard/crypto/weekly/profit",
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+                     "Accept": "text/html,application/xhtml+xml"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+        # Extract all valid 40-char hex addresses
+        found = list(dict.fromkeys(
+            a for a in _re2.findall(r'0x[0-9a-fA-F]{40}\b', html)
+            if len(a) == 42
+        ))
+        print(f"[COPY] Leaderboard scrape: {len(found)} unique addresses")
+
+        # Test each — keep only those with recent crypto activity
+        good = []
+        for addr in found[:40]:  # limit to top 40 to avoid rate limiting
+            try:
+                url = f"https://data-api.polymarket.com/activity?user={addr}&limit=20"
+                req2 = urllib.request.Request(url, headers={"User-Agent": "autobet/1.0"})
+                with urllib.request.urlopen(req2, timeout=8) as r2:
+                    acts = json.loads(r2.read().decode())
+                crypto = [a for a in acts if any(
+                    kw in (a.get("title") or "").lower() for kw in POLY_CRYPTO_KWS
+                )]
+                if len(crypto) >= 3:  # at least 3 crypto trades in recent history
+                    good.append(addr)
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        # Merge with seeds, deduplicate (keep checksummed version)
+        seen_lower = {}
+        for a in POLY_COPY_SEED + good:
+            seen_lower[a.lower()] = a
+        merged = list(seen_lower.values())[:25]  # cap at 25 wallets
+
+        # Save to settings
+        conn_w = db_connect()
+        conn_w.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                       ("poly_tracked_wallets", ",".join(merged), now_cst().isoformat()))
+        conn_w.commit()
+        conn_w.close()
+        _last_wallet_discover = int(time.time())
+        print(f"[COPY] Auto-discovered {len(good)} new wallets, total tracked: {len(merged)}")
+        return merged
+    except Exception as e:
+        print(f"[COPY] Discovery failed: {e}")
+        return POLY_COPY_SEED
+
+def _poll_copy_wallets(ts):
+    """Poll tracked wallets for recent crypto trades; aggregate into coin-level signals."""
+    global _last_wallet_discover
+    # Auto-discover every 24 hours
+    if ts - _last_wallet_discover > 86400:
+        _discover_poly_wallets()
+
+    conn_w = db_connect()
+    wallet_row = conn_w.execute("SELECT value FROM settings WHERE key='poly_tracked_wallets'").fetchone()
+    conn_w.close()
+    if wallet_row and wallet_row[0].strip():
+        wallets = [w.strip() for w in wallet_row[0].split(",") if w.strip()]
+    else:
+        wallets = POLY_COPY_SEED
+
+    wallet_signals = {}
+    for wallet in wallets:
+        try:
+            w_url = f"https://data-api.polymarket.com/activity?user={wallet}&limit=15"
+            w_req = urllib.request.Request(w_url, headers={"User-Agent": "autobet/1.0"})
+            with urllib.request.urlopen(w_req, timeout=10) as wr:
+                activities = json.loads(wr.read().decode())
+            if not isinstance(activities, list):
+                activities = activities.get("data", [])
+            for act in activities:
+                act_ts = int(act.get("timestamp", act.get("createdAt", 0)) or 0)
+                if ts - act_ts > 1200:  # only last 20 minutes
+                    continue
+                question = (act.get("title") or "").lower()
+                outcome  = (act.get("outcome") or act.get("side") or "").strip().upper()
+                size     = float(act.get("usdcSize") or act.get("size") or 0)
+                for coin, kws in POLY_COIN_KEYWORDS.items():
+                    if any(kw in question for kw in kws):
+                        if coin not in wallet_signals:
+                            wallet_signals[coin] = {"YES": 0, "NO": 0, "vol": 0.0, "wallets": []}
+                        if outcome in ("YES", "BUY"):
+                            wallet_signals[coin]["YES"] += 1
+                            wallet_signals[coin]["vol"] += size
+                        elif outcome in ("NO", "SELL"):
+                            wallet_signals[coin]["NO"] += 1
+                            wallet_signals[coin]["vol"] += size
+                        label = wallet[:8] + "…"
+                        if label not in wallet_signals[coin]["wallets"]:
+                            wallet_signals[coin]["wallets"].append(label)
+                        break
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    with _state_lock:
+        _poly_wallets.clear()
+        _poly_wallets.update(wallet_signals)
+    if wallet_signals:
+        sig_summary = {c: f"{v['YES']}Y/{v['NO']}N ${v['vol']:.0f}" for c, v in wallet_signals.items()}
+        print(f"[COPY] Signals: {sig_summary}")
 
 # ── Polymarket collection ───────────────────────────────────────────────────────
 POLY_COIN_KEYWORDS = {
@@ -1111,6 +1305,13 @@ def collect_polymarket():
             with _state_lock:
                 _poly_mkts.update(poly_update)
                 _health_status["polymarket"] = {"ok": bool(poly_update), "msg": f"{len(poly_update)} coins mapped", "ts": ts}
+
+            # Feature 7: Copy-trading — auto-discover + poll top wallets
+            try:
+                _poll_copy_wallets(ts)
+            except Exception as ce:
+                print(f"[COPY] {ce}")
+
         except Exception as e:
             print(f"[POLYMARKET] Error: {e}")
             with _state_lock:
@@ -1275,7 +1476,8 @@ def get_price_at(conn, coin, ts, tol=120):
     return row[0] if row else None
 
 def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None,
-                    rules_signal=None, knn_signal=None, price_momentum=None):
+                    rules_signal=None, knn_signal=None, price_momentum=None,
+                    poly_price=None, prev_outcomes=None, fee_note=None):
     if not MINIMAX_KEY:
         return None
     vol_line = ""
@@ -1333,9 +1535,36 @@ def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=
     else:
         consensus = "WEAK/NO CONSENSUS: limited quantitative signal, rely on order book analysis"
 
+    # Polymarket cross-venue signal
+    if poly_price is not None:
+        try:
+            rules_mid = None
+            if rules_signal:
+                re_ = rules_signal.get("entry", 0)
+                rd_ = rules_signal.get("direction", "")
+                rules_mid = re_ if rd_ == "YES" else round(1 - re_, 3) if re_ else None
+            kalshi_mid_est = rules_mid or 0.5
+            diff = poly_price - kalshi_mid_est
+            arb_note = f"arb gap {abs(diff):.3f}" if abs(diff) > 0.05 else "aligned with Kalshi"
+            engine_lines.append(f"- Polymarket:      YES={poly_price:.3f}  ({arb_note})")
+            if poly_price > 0.62:
+                agreement_count["YES"] += 1
+            elif poly_price < 0.38:
+                agreement_count["NO"] += 1
+        except Exception:
+            pass
+
+    # Previous window outcomes (recent momentum)
+    if prev_outcomes:
+        engine_lines.append(f"- Recent outcomes: {prev_outcomes}  (window sequence, newest first)")
+
+    # Fee-adjusted EV note
+    fee_line = f"\n{fee_note}" if fee_note else ""
+
     engine_block = ("\n\nEngine results (pre-computed before your analysis):\n"
                     + "\n".join(engine_lines)
-                    + f"\nConsensus: {consensus}")
+                    + f"\nConsensus: {consensus}"
+                    + fee_line)
 
     prompt = f"""You are the final decision-maker in a multi-engine prediction market trading system for 15-minute {coin} price contracts.
 
@@ -1659,6 +1888,14 @@ def decision_loop():
                     if not coin_price:
                         print(f"[SKIP] {coin} wts={wts}: no coin price")
                         return
+                    # ── Feature 9: Window entry timing delay ────────────────
+                    # Avoid thin early liquidity — wait until at least 60s into window
+                    secs_into_window = int(time.time()) - wts
+                    if secs_into_window < 60:
+                        wait_secs = 60 - secs_into_window
+                        print(f"[TIMING] {coin} wts={wts}: waiting {wait_secs}s (only {secs_into_window}s into window)")
+                        time.sleep(wait_secs)
+
                     # Stagger MiniMax API calls only — market data already checked above
                     if api_delay:
                         time.sleep(api_delay)
@@ -1688,6 +1925,134 @@ def decision_loop():
                         print(f"[VOLUME] {coin} wts={wts}: PASS — volume {int(market_volume)} < {int(min_vol)}")
                         return
 
+                    # ── Feature 1: Time-of-day blackout filter ───────────────
+                    try:
+                        bh_row = conn.execute(
+                            "SELECT value FROM settings WHERE key='blackout_hours'"
+                        ).fetchone()
+                        if bh_row and bh_row[0].strip():
+                            blackout = [int(h.strip()) for h in bh_row[0].split(",") if h.strip().isdigit()]
+                            cur_hour = now_cst().hour
+                            if cur_hour in blackout:
+                                conn.execute("""
+                                    INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                                    VALUES (?,?,?,?,?,?,?)
+                                """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
+                                      f"Blackout PASS: hour {cur_hour}:00 CT in blackout list",
+                                      now_cst().isoformat()))
+                                conn.commit()
+                                print(f"[BLACKOUT] {coin} wts={wts}: PASS — hour {cur_hour} blacklisted")
+                                return
+                    except Exception:
+                        pass
+
+                    # ── Feature 2b: Coin auto-pause by rolling WR ────────────
+                    try:
+                        ap_row = conn.execute(
+                            "SELECT value FROM settings WHERE key='autopause_wr_threshold'"
+                        ).fetchone()
+                        autopause_threshold = float(ap_row[0]) if ap_row else 0.0
+                        if autopause_threshold > 0:
+                            ap_rows = conn.execute("""
+                                SELECT result FROM paper_trades
+                                WHERE coin=? AND result IN ('WIN','LOSS')
+                                ORDER BY window_ts DESC LIMIT 15
+                            """, (coin,)).fetchall()
+                            if len(ap_rows) >= 10:
+                                wr = sum(1 for r in ap_rows if r[0]=='WIN') / len(ap_rows)
+                                if wr < autopause_threshold:
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                                        VALUES (?,?,?,?,?,?,?)
+                                    """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
+                                          f"AutoPause: {coin} WR {wr:.0%} over last {len(ap_rows)} trades < {autopause_threshold:.0%} threshold",
+                                          now_cst().isoformat()))
+                                    conn.commit()
+                                    print(f"[AUTOPAUSE] {coin} wts={wts}: PASS — WR {wr:.0%} below {autopause_threshold:.0%}")
+                                    return
+                    except Exception:
+                        pass
+
+                    # ── Feature 6: Block entry in last 2 minutes ─────────────
+                    secs_left_now = max(0, wts + 900 - int(time.time()))
+                    if secs_left_now < 120:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            VALUES (?,?,?,?,?,?,?)
+                        """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
+                              f"Timing PASS: only {secs_left_now}s left in window (< 120s entry block)",
+                              now_cst().isoformat()))
+                        conn.commit()
+                        print(f"[TIMING] {coin} wts={wts}: PASS — {secs_left_now}s left, too late to enter")
+                        return
+
+                    # ── Feature 2: Polymarket cross-venue signal ─────────────
+                    with _state_lock:
+                        poly_price = _poly_mkts.get(coin, {}).get("yes_price")
+                        wallet_sig = dict(_poly_wallets.get(coin, {}))
+                        comments   = list(_kalshi_comments.get(coin, []))
+
+                    # ── Feature 3: Previous window outcomes ──────────────────
+                    prev_outcomes = None
+                    try:
+                        prev_rows = conn.execute("""
+                            SELECT result FROM paper_trades
+                            WHERE coin=? AND result IN ('WIN','LOSS')
+                            ORDER BY window_ts DESC LIMIT 3
+                        """, (coin,)).fetchall()
+                        if prev_rows:
+                            prev_outcomes = "/".join(r[0] for r in prev_rows)
+                    except Exception:
+                        pass
+
+                    # ── Feature 8: Fee-adjusted EV note ─────────────────────
+                    fee_note = None
+                    try:
+                        yes_mid_est = (yes_bid_v + yes_ask_v) / 2 if yes_bid_v and yes_ask_v else None
+                        if yes_mid_est:
+                            fee_per_c = round(KALSHI_FEE_RATE * yes_mid_est * (1 - yes_mid_est), 4)
+                            net_entry_yes = round(yes_ask_v + fee_per_c, 4)
+                            net_entry_no  = round((1 - yes_bid_v) + fee_per_c, 4)
+                            fee_note = (f"Fee-adjusted cost: YES entry {net_entry_yes:.3f} "
+                                        f"(raw {yes_ask_v:.3f} + fee {fee_per_c:.4f}/contract), "
+                                        f"NO entry {net_entry_no:.3f} — factor fees into EV")
+                    except Exception:
+                        pass
+
+                    # ── Feature 6: Order book depth summary ─────────────────
+                    ob_depth_note = None
+                    try:
+                        ticker_for_ob = mkt.get("ticker", "")
+                        if ticker_for_ob:
+                            ob_data = fetch_kalshi_order_book(ticker_for_ob)
+                            if ob_data:
+                                ob_depth_note = ob_data
+                                if fee_note:
+                                    fee_note = fee_note + "\n" + ob_depth_note
+                                else:
+                                    fee_note = ob_depth_note
+                    except Exception:
+                        pass
+
+                    # ── Feature 5: Kalshi comment sentiment ──────────────────
+                    if comments:
+                        comment_text = " | ".join(comments[:5])
+                        comment_note = f"Market comments (recent): {comment_text}"
+                        fee_note = (fee_note + "\n" + comment_note) if fee_note else comment_note
+
+                    # ── Feature 7: Polymarket copy-trading wallet signals ─────
+                    if wallet_sig and (wallet_sig.get("YES", 0) + wallet_sig.get("NO", 0)) > 0:
+                        yes_n = wallet_sig.get("YES", 0)
+                        no_n  = wallet_sig.get("NO", 0)
+                        vol   = wallet_sig.get("vol", 0.0)
+                        total = yes_n + no_n
+                        dominant = "YES" if yes_n >= no_n else "NO"
+                        wallet_note = (f"Smart money (top leaderboard wallets, last 20min): "
+                                       f"{yes_n}/{total} bought YES, {no_n}/{total} bought NO "
+                                       f"${vol:.0f} total volume → {dominant} lean. "
+                                       f"Wallets: {wallet_sig.get('wallets', [])}")
+                        fee_note = (fee_note + "\n" + wallet_note) if fee_note else wallet_note
+
                     # 1. Try betbot autoresearch signal file first
                     bb_dir, bb_entry, bb_size = read_betbot_signal(coin, wts)
                     if bb_dir:
@@ -1697,7 +2062,9 @@ def decision_loop():
                     else:
                         # 2. Use configured engine (minimax_llm / rules / knn / hybrid)
                         result = run_engine(get_engine_for_coin(coin), coin, mkt, ticks, coin_price, ticks_summary,
-                                            market_volume=market_volume, spread=spread_v)
+                                            market_volume=market_volume, spread=spread_v,
+                                            poly_price=poly_price, prev_outcomes=prev_outcomes,
+                                            fee_note=fee_note)
 
                     if not result:
                         # Fallback disabled — 160 fallback trades were net negative on every coin
@@ -1814,7 +2181,7 @@ def decision_loop():
                     if betbot_size and betbot_size > 0:
                         size = min(float(betbot_size), capital_pre * 0.10)
                     else:
-                        size = calc_stake(coin, confidence, capital_pre)
+                        size = calc_stake(coin, confidence, capital_pre, entry=entry)
                     ok, reason = check_risk(coin, direction, entry, size)
                     if not ok:
                         print(f"[RISK] {coin}: blocked — {reason}")
@@ -1978,8 +2345,16 @@ def decision_loop():
                 pool_on = pool_enabled and pool_enabled[0] == "1"
                 live_on = global_live and global_live[0]
                 if pool_on and live_on and _pool_signals and _pool_last_placed_wts < wts:
-                    # Get rolling win rate for tiebreak
+                    # Get rolling win rate for scoring
                     conn_pool2 = db_connect()
+                    # Feature 10: multi-position pool threshold
+                    try:
+                        pool_thresh_row = conn_pool2.execute(
+                            "SELECT value FROM settings WHERE key='pool_multi_threshold'"
+                        ).fetchone()
+                        pool_multi_threshold = float(pool_thresh_row[0]) if pool_thresh_row else 0.0
+                    except Exception:
+                        pool_multi_threshold = 0.0
                     def rolling_wr(coin):
                         rows = conn_pool2.execute(
                             "SELECT result FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS') ORDER BY window_ts DESC LIMIT 10",
@@ -1988,26 +2363,52 @@ def decision_loop():
                         if len(rows) < 3: return 0.5
                         return sum(1 for r in rows if r[0]=='WIN') / len(rows)
                     # Score = confidence * 0.7 + rolling_wr * 0.3
-                    best_coin = max(_pool_signals, key=lambda c: _pool_signals[c]['confidence'] * 0.7 + rolling_wr(c) * 0.3)
-                    conn_pool2.close()
-                    sig = _pool_signals[best_coin]
-                    order_id, used_ticker, order_err = place_kalshi_order(
-                        best_coin, sig['ticker'], sig['direction'], sig['contracts'], sig['entry']
+                    scored = sorted(
+                        [(c, _pool_signals[c]['confidence'] * 0.7 + rolling_wr(c) * 0.3) for c in _pool_signals],
+                        key=lambda x: x[1], reverse=True
                     )
-                    conn_pool3 = db_connect()
-                    conn_pool3.execute("""
-                        INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
-                            limit_price, order_id, status, error, created_at)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """, (best_coin, wts, used_ticker, sig['direction'], sig['contracts'],
-                          max(1, min(99, round(sig['entry']*100))),
-                          order_id, "placed" if order_id else "failed",
-                          order_err, now_cst().isoformat()))
-                    conn_pool3.commit()
-                    conn_pool3.close()
+                    conn_pool2.close()
+                    # Feature 3: Correlated coin dedup — keep only best per group
+                    CORR_GROUPS = [{"BTC", "ETH"}, {"SOL", "XRP", "DOGE", "BNB", "HYPE"}]
+                    seen_groups = set()
+                    deduped = []
+                    for c, s in scored:
+                        grp = next((i for i, g in enumerate(CORR_GROUPS) if c in g), -1)
+                        if grp >= 0 and grp in seen_groups:
+                            print(f"[POOL] {c} skipped (correlated group {grp} already represented)")
+                            continue
+                        if grp >= 0:
+                            seen_groups.add(grp)
+                        deduped.append((c, s))
+                    scored = deduped
+                    # If multi-threshold set and > 0, place all coins scoring above it; otherwise just winner
+                    if pool_multi_threshold > 0:
+                        pool_winners = [(c, s) for c, s in scored if s >= pool_multi_threshold]
+                        if not pool_winners:
+                            pool_winners = [scored[0]]  # always place at least winner
+                    else:
+                        pool_winners = [scored[0]]
+                    skipped = [c for c, _ in scored if c not in [w for w, _ in pool_winners]]
+                    for best_coin, best_score in pool_winners:
+                        sig = _pool_signals[best_coin]
+                        order_id, used_ticker, order_err = place_kalshi_order(
+                            best_coin, sig['ticker'], sig['direction'], sig['contracts'], sig['entry']
+                        )
+                        conn_pool3 = db_connect()
+                        conn_pool3.execute("""
+                            INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
+                                limit_price, order_id, status, error, created_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)
+                        """, (best_coin, wts, used_ticker, sig['direction'], sig['contracts'],
+                              max(1, min(99, round(sig['entry']*100))),
+                              order_id, "placed" if order_id else "failed",
+                              order_err, now_cst().isoformat()))
+                        conn_pool3.commit()
+                        conn_pool3.close()
+                        print(f"[POOL] {best_coin} {sig['direction']}@{sig['entry']:.3f} conf={sig['confidence']:.2f} score={best_score:.2f}  order={'OK' if order_id else 'FAIL'}")
                     _pool_last_placed_wts = wts
-                    losers = [c for c in _pool_signals if c != best_coin]
-                    print(f"[POOL] Winner: {best_coin} {sig['direction']}@{sig['entry']:.3f} conf={sig['confidence']:.2f}  skipped: {losers}  order={'OK' if order_id else 'FAIL'}")
+                    if skipped:
+                        print(f"[POOL] skipped (below threshold {pool_multi_threshold:.2f}): {skipped}")
             except Exception as pe:
                 print(f"[POOL] {pe}")
             last_decided_wts = wts
@@ -2066,7 +2467,8 @@ def get_engine_for_coin(coin):
     except Exception:
         return "minimax_llm"
 
-def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_volume=None, spread=None):
+def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_volume=None, spread=None,
+               poly_price=None, prev_outcomes=None, fee_note=None):
     if engine_key == "rules_engine":
         return rules_engine(coin, mkt)
     elif engine_key == "vector_knn":
@@ -2087,7 +2489,9 @@ def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_v
         return minimax_analyze(coin, ticks_summary, coin_price,
                                market_volume=market_volume, spread=spread,
                                rules_signal=rules_sig, knn_signal=knn_sig,
-                               price_momentum=price_momentum)
+                               price_momentum=price_momentum,
+                               poly_price=poly_price, prev_outcomes=prev_outcomes,
+                               fee_note=fee_note)
 
 def rules_engine(coin, mkt):
     try:
@@ -3539,12 +3943,19 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Max Stake ($) {tooltip_html("max_drawdown_pct")}</span><input type="number" name="max_stake" value="{rs['max_stake']:.0f}" step="1" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Cooldown After N Losses {tooltip_html("cooldown_after_losses")}</span><input type="number" name="cooldown_after_losses" value="{rs['cooldown_after_losses']}" step="1" min="0" style="width:100px"></div>
 <div class="form-row"><span class="form-label">Min Volume (contracts) {tooltip_html("min_volume")}</span><input type="number" name="min_volume" value="{settings.get('min_volume', 500)}" step="50" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Skip windows below this 24h volume. 0 = disabled.</span></div>
+<div class="form-row"><span class="form-label">Blackout Hours (CT)</span><input type="text" name="blackout_hours" value="{settings.get('blackout_hours', '8,10,11,17,18,23')}" style="width:200px" placeholder="e.g. 8,10,11,17"><span style="color:#8b949e;font-size:11px;margin-left:8px">Skip trading during these hours (CT, 0-23). Comma-separated. Based on your hour WR data.</span></div>
+<div class="form-row"><span class="form-label">Auto-Pause WR Threshold</span><input type="number" name="autopause_wr_threshold" value="{settings.get('autopause_wr_threshold', 0.42)}" step="0.01" min="0" max="1" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Pause coin if rolling WR (last 15 trades) falls below this. 0 = disabled. Suggested: 0.42</span></div>
+<div class="form-row"><span class="form-label">Tracked Polymarket Wallets</span><input type="text" name="poly_tracked_wallets" value="{settings.get('poly_tracked_wallets', '')}" style="width:420px" placeholder="0xABC123...,0xDEF456... (comma-separated)"><span style="color:#8b949e;font-size:11px;margin-left:8px">Wallet addresses to copy-trade. Their recent buys/sells are shown to the LLM as smart money signals.</span></div>
 <div style="margin-top:16px;padding-top:14px;border-top:1px solid #21262d">
   <div style="font-size:12px;font-weight:600;color:#58a6ff;margin-bottom:10px">Early Exit Engine</div>
   <div class="form-row"><span class="form-label">Take Profit (%)</span><input type="number" name="exit_take_profit_pct" value="{settings.get('exit_take_profit_pct', 40)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell when unrealized P&L ≥ this % of stake. 0 = disabled.</span></div>
   <div class="form-row"><span class="form-label">Stop Loss (%)</span><input type="number" name="exit_stop_loss_pct" value="{settings.get('exit_stop_loss_pct', 65)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell when losing ≥ this % of stake (recovers remaining value). 0 = disabled.</span></div>
   <div class="form-row"><span class="form-label">Time Cliff (secs)</span><input type="number" name="exit_time_cliff_secs" value="{settings.get('exit_time_cliff_secs', 90)}" step="10" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell any winning position when this many seconds remain. 0 = disabled.</span></div>
   <div class="form-row"><span class="form-label">LLM Mid-Window Check</span><select name="exit_llm_check" style="width:100px"><option value="1" {"selected" if settings.get("exit_llm_check","1")=="1" else ""}>Enabled</option><option value="0" {"selected" if settings.get("exit_llm_check","1")=="0" else ""}>Disabled</option></select><span style="color:#8b949e;font-size:11px;margin-left:8px">Ask LLM to evaluate hold/sell at ~midpoint of window.</span></div>
+</div>
+<div style="margin-top:16px;padding-top:14px;border-top:1px solid #21262d">
+  <div style="font-size:12px;font-weight:600;color:#58a6ff;margin-bottom:10px">Pool Mode — Multi-Position</div>
+  <div class="form-row"><span class="form-label">Multi-Position Threshold</span><input type="number" name="pool_multi_threshold" value="{settings.get('pool_multi_threshold', 0)}" step="0.05" min="0" max="1" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Pool score threshold to place multiple orders (0 = single winner only). e.g. 0.65 = place all coins scoring ≥ 0.65.</span></div>
 </div>
 <div style="margin-top:14px"><button class="btn btn-primary" type="submit">Save Risk Settings</button></div>
 </form>'''
@@ -4441,7 +4852,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                   ("exit_take_profit_pct", float(params.get("exit_take_profit_pct", 40))),
                                   ("exit_stop_loss_pct",   float(params.get("exit_stop_loss_pct", 65))),
                                   ("exit_time_cliff_secs", float(params.get("exit_time_cliff_secs", 90))),
-                                  ("exit_llm_check",       params.get("exit_llm_check", "1"))]:
+                                  ("exit_llm_check",       params.get("exit_llm_check", "1")),
+                                  ("pool_multi_threshold", float(params.get("pool_multi_threshold", 0))),
+                                  ("blackout_hours",       params.get("blackout_hours", "8,10,11,17,18,23")),
+                                  ("autopause_wr_threshold", float(params.get("autopause_wr_threshold", 0.42))),
+                                  ("poly_tracked_wallets", params.get("poly_tracked_wallets", ""))]:
                 conn.execute("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                              (key, str(default), now_cst().isoformat()))
             conn.commit()
@@ -4587,16 +5002,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"error": "not found"}, 404)
 
 
-# ── Variable stake sizing ───────────────────────────────────────────────────────
-def calc_stake(coin, confidence, capital):
-    """Scale stake between min and max based on confidence."""
+# ── Variable stake sizing (Kelly Criterion) ─────────────────────────────────────
+def calc_stake(coin, confidence, capital, entry=0.5):
+    """Half-Kelly bet sizing: f = (p - e) / (1 - e), scaled to half for safety.
+    max_stake scales proportionally with capital growth above STARTING_CAPITAL."""
     conn = db_connect()
     min_s = float((conn.execute("SELECT value FROM settings WHERE key='min_stake'").fetchone() or [TRADE_SIZE])[0])
     max_s = float((conn.execute("SELECT value FROM settings WHERE key='max_stake'").fetchone() or [TRADE_SIZE * 1.5])[0])
     conn.close()
-    conf_norm = max(0.0, min(1.0, (float(confidence) - 0.5) * 2.0))
-    size = min_s + conf_norm * (max_s - min_s)
-    return round(min(max(size, min_s), capital * 0.10), 2)
+    # Feature 4: compound — scale max_stake with capital growth
+    if capital > STARTING_CAPITAL:
+        growth = capital / STARTING_CAPITAL
+        max_s = max_s * growth
+    p = float(confidence)
+    e = float(entry) if entry and 0.05 < entry < 0.95 else 0.5
+    # Kelly fraction: expected edge divided by potential gain
+    kelly_f = max(0.0, (p - e) / (1.0 - e))
+    # Half-Kelly for variance reduction
+    half_kelly = kelly_f * 0.5
+    # Convert fraction to dollar amount, capped at max_stake and 10% of capital
+    size = capital * half_kelly
+    size = max(min_s, min(size, max_s, capital * 0.10))
+    return round(size, 2)
 
 # ── Insights page ───────────────────────────────────────────────────────────────
 def build_insights_page(user=None, coin_filter=None):
