@@ -47,6 +47,26 @@ def now_cst():
 def ts_cst(ts):
     return datetime.fromtimestamp(ts, tz=_TZ)
 
+def order_status_label(status, filled, window_ts=None):
+    """Human-readable status label for a live order."""
+    filled = int(filled or 0)
+    if status == "canceled":
+        if filled > 0:
+            return "partial+expired", "#e3b341"
+        # If window_ts known, check if cancelled at window close (expired) vs mid-window
+        return "expired unfilled", "#8b949e"
+    if status in ("filled", "executed"):
+        return "filled", "#3fb950"
+    if status == "filled_partial":
+        return f"partial ({filled}c)", "#e3b341"
+    if status == "placed":
+        return "pending", "#e3b341"
+    if status == "failed":
+        return "failed", "#f85149"
+    if status == "exited":
+        return "exited", "#58a6ff"
+    return status, "#8b949e"
+
 def tz_label():
     try:
         return now_cst().strftime("%Z")
@@ -78,9 +98,9 @@ COINBASE_URL  = "https://api.coinbase.com/v2/prices/{}-USD/spot"
 MINIMAX_URL   = "https://api.minimax.io/anthropic/v1/messages"
 
 STARTING_CAPITAL = 500.0
-TRADE_SIZE       = 20.0
+TRADE_SIZE       = 15.0
 KALSHI_FEE_RATE  = 0.07
-MAX_CONTRACTS    = 500    # Realistic Kalshi order book depth at any price
+MAX_CONTRACTS    = 500   # Realistic Kalshi order book depth at any price
 ENTRY_FLOOR      = 0.05   # Below this = lottery ticket; liquidity impossible
 ENTRY_CEILING    = 0.80   # Above this = negative EV confirmed across all coins (data: 0.8+ entry = -$1,886 net)
 
@@ -214,25 +234,64 @@ def kalshi_post(path, body_dict):
         print(f"[KALSHI] POST {path}: {e}")
         return None, str(e)
 
+def kalshi_delete(path):
+    url = KALSHI_BASE + path
+    auth_path = "/trade-api/v2" + path
+    hdrs = kalshi_auth_headers("DELETE", auth_path)
+    hdrs["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, headers=hdrs, method="DELETE")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode()), None
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode()
+        print(f"[KALSHI] DELETE {path} HTTP {e.code}: {err_body}")
+        return None, f"HTTP {e.code}: {err_body}"
+    except Exception as e:
+        print(f"[KALSHI] DELETE {path}: {e}")
+        return None, str(e)
+
+def cancel_kalshi_order(order_id):
+    resp, err = kalshi_delete(f"/portfolio/orders/{order_id}")
+    if err:
+        return False, err
+    return True, None
+
 def place_kalshi_order(coin, ticker, direction, contracts, entry):
     """
     Place a limit order on Kalshi.
     Fetches a fresh ticker from the API to avoid using stale cached tickers.
     Returns (order_id, actual_ticker_used, error_str)
     """
-    # Always get the freshest open ticker — never trust cached value
-    series = SERIES.get(coin, f"KX{coin}15M")
-    fresh = kalshi_get("/markets", {"series_ticker": series, "status": "open", "limit": 1})
-    fresh_mkts = (fresh or {}).get("markets", [])
-    if fresh_mkts:
-        live_ticker = fresh_mkts[0]["ticker"]
-    else:
-        live_ticker = ticker  # fallback to cached
+    # Use the ticker from _active_mkts (already fresh from the Kalshi collector)
+    with _state_lock:
+        cached_mkt = _active_mkts.get(coin, {})
+    live_ticker = cached_mkt.get("ticker") or ticker
     if not live_ticker:
         return None, ticker, "No open market found"
 
     side = "yes" if direction == "YES" else "no"
-    limit_price = max(1, min(99, round(entry * 100)))
+    # Use the freshest ask price from the collector rather than the decision-time entry.
+    # By the time the LLM finishes (~3-5s), the market may have moved past the stale entry.
+    with _state_lock:
+        live_mkt = _active_mkts.get(coin, {})
+    if direction == "YES":
+        current_ask = float(live_mkt.get("yes_ask") or entry)
+    else:
+        current_ask = float(live_mkt.get("no_ask") or entry)
+    # Price off the live ask + 2¢ buffer so minor moves don't miss the fill
+    # Abort if market moved >25% from decision entry — avoids overpaying when LLM is slow
+    if entry > 0 and current_ask > entry * 1.25:
+        print(f"[SKIP] {coin} {direction}: market moved {entry:.3f} -> {current_ask:.3f} since decision, aborting")
+        return None, live_ticker, f"Market moved: entry={entry:.3f} live={current_ask:.3f}"
+    limit_price = max(1, min(99, round(current_ask * 100) + 2))
+    # Hard cost cap: recalculate contracts at live price so spend stays within max_stake
+    if current_ask > 0:
+        _cap_size = get_risk_settings().get("max_stake", TRADE_SIZE)
+        max_contracts_at_live = max(1, int(_cap_size / current_ask))
+        if int(contracts) > max_contracts_at_live:
+            print(f"[CAP] {coin}: {int(contracts)} contracts @ {current_ask:.2f}, capping to {max_contracts_at_live} (max_stake=${_cap_size:.0f})")
+            contracts = max_contracts_at_live
     body = {
         "ticker": live_ticker,
         "client_order_id": f"autobet_{live_ticker}_{int(time.time())}",
@@ -273,6 +332,63 @@ def sell_kalshi_position(ticker, direction, contracts, exit_price):
     order_id = (resp or {}).get("order", {}).get("order_id")
     return order_id, None
 
+def buy_reversal_hedge(coin, ticker, main_direction, window_ts, yes_bid, yes_ask):
+    """After exiting a high-value position, buy cheap reversal contracts as a lottery hedge."""
+    try:
+        conn_s = db_connect()
+        def _s(k, d):
+            r = conn_s.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+            return float(r[0]) if r else d
+        hedge_contracts   = int(_s("hedge_contracts", 25))
+        hedge_max_ask_cts = _s("hedge_max_ask_cents", 3.0)
+        conn_s.close()
+
+        hedge_side = "NO" if main_direction == "YES" else "YES"
+
+        # Hedge ask: opposite side of what we just sold
+        if hedge_side == "NO":
+            hedge_ask = 1.0 - yes_bid   # NO ask ≈ 1 - YES bid
+        else:
+            hedge_ask = yes_ask
+
+        if hedge_ask <= 0 or hedge_ask > (hedge_max_ask_cts / 100.0):
+            print(f"[HEDGE] {coin}: {hedge_side} ask={hedge_ask:.3f} > max {hedge_max_ask_cts:.0f}¢, skipping")
+            return
+
+        limit_cts = max(1, min(int(hedge_max_ask_cts), round(hedge_ask * 100) + 1))
+
+        body = {
+            "ticker": ticker,
+            "client_order_id": f"autobet_hedge_{ticker}_{int(time.time())}",
+            "type": "limit",
+            "action": "buy",
+            "side": hedge_side.lower(),
+            "count": hedge_contracts,
+            "yes_price": limit_cts if hedge_side == "YES" else (100 - limit_cts),
+        }
+        resp, err = kalshi_post("/portfolio/orders", body)
+        if err:
+            print(f"[HEDGE] {coin}: order failed — {err}")
+            return
+        order_id = (resp or {}).get("order", {}).get("order_id")
+        if not order_id:
+            print(f"[HEDGE] {coin}: no order_id returned")
+            return
+
+        conn_h = db_connect()
+        conn_h.execute("""
+            INSERT INTO live_orders
+                (coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, is_hedge, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'placed', 1, ?)
+        """, (coin, window_ts, ticker, hedge_side, hedge_contracts,
+              limit_cts, order_id, now_cst().isoformat()))
+        conn_h.commit()
+        conn_h.close()
+        print(f"[HEDGE] {coin}: bought {hedge_contracts} {hedge_side} @ {limit_cts}¢ (order={order_id[:8]})")
+    except Exception as e:
+        print(f"[HEDGE] {coin}: error — {e}")
+
+
 def check_exit_positions():
     """
     Evaluate active live positions for early exit.
@@ -289,10 +405,13 @@ def check_exit_positions():
         def _setting(key, default):
             row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             return float(row[0]) if row else default
-        take_profit_pct = _setting("exit_take_profit_pct", 40.0)
-        stop_loss_pct   = _setting("exit_stop_loss_pct",   65.0)
-        time_cliff_secs = _setting("exit_time_cliff_secs", 90.0)
-        llm_exit_enabled = _setting("exit_llm_check", 1.0)
+        take_profit_pct   = _setting("exit_take_profit_pct", 40.0)
+        hard_tp_pct       = _setting("exit_hard_tp_pct",    80.0)
+        stop_loss_pct     = _setting("exit_stop_loss_pct",  65.0)
+        time_cliff_secs   = _setting("exit_time_cliff_secs", 90.0)
+        llm_exit_enabled  = _setting("exit_llm_check", 1.0)
+        hedge_enabled     = _setting("hedge_enabled", 1.0)
+        exit_price_target = _setting("exit_price_target_cents", 90.0) / 100.0
 
         now = int(time.time())
         wts = kalshi_window_ts()
@@ -304,7 +423,7 @@ def check_exit_positions():
             FROM live_orders
             WHERE window_ts = ? AND status IN ('filled','executed','filled_partial')
               AND filled_contracts > 0 AND avg_fill_price > 0
-              AND exit_at IS NULL
+              AND exit_at IS NULL AND (is_hedge IS NULL OR is_hedge = 0) AND (is_lottery IS NULL OR is_lottery = 0)
         """, (wts,)).fetchall()
         conn.close()
 
@@ -357,17 +476,61 @@ def check_exit_positions():
             except Exception:
                 peak_pct = unreal_pct
 
-            # Trailing stop: if was up >= take_profit_pct and has fallen > 15% from peak, exit
+            # Rule 0: Price target — sell when contract hits target price (default 90¢), buy reversal hedge
             trail_drop = peak_pct - unreal_pct
-            if peak_pct >= take_profit_pct and trail_drop >= 15.0:
+            if cur_bid >= exit_price_target:
+                reason = f"price_target ({cur_bid*100:.0f}¢ >= {exit_price_target*100:.0f}¢)"
+            # Hard take-profit: sell immediately at hard_tp_pct regardless of time
+            elif unreal_pct >= hard_tp_pct:
+                reason = f"hard_take_profit ({unreal_pct:+.0f}% >= {hard_tp_pct:.0f}%)"
+            # Trailing stop: if was up >= take_profit_pct and has fallen > 15% from peak, exit
+            elif peak_pct >= take_profit_pct and trail_drop >= 15.0:
                 reason = f"trailing_stop (peak {peak_pct:+.0f}% → now {unreal_pct:+.0f}%, dropped {trail_drop:.0f}%)"
             elif unreal_pct >= take_profit_pct and secs_left <= 120:
                 # Lock in profit in last 2 minutes if at target
                 reason = f"take_profit_lock ({unreal_pct:+.0f}% >= {take_profit_pct:.0f}%, {secs_left}s left)"
 
-            # Rule 2: Stop loss
+            # Rule 2: Stop loss — but check rules engine first if time remains
             elif unreal_pct <= -stop_loss_pct:
-                reason = f"stop_loss ({unreal_pct:+.0f}% <= -{stop_loss_pct:.0f}%)"
+                deferred = False
+                if secs_left > 180:
+                    # Check how many times we've already deferred this position
+                    defer_key = f"sl_defer_{lo_id}"
+                    try:
+                        conn_d = db_connect()
+                        defer_row = conn_d.execute(
+                            "SELECT value FROM settings WHERE key=?", (defer_key,)
+                        ).fetchone()
+                        defer_count = int(defer_row[0]) if defer_row else 0
+                        conn_d.close()
+                    except Exception:
+                        defer_count = 0
+
+                    if defer_count < 2:
+                        # Re-run rules engine — if it still agrees with our direction, defer
+                        re_signal = rules_engine(coin, mkt)
+                        re_dir = re_signal.get("direction") if re_signal else None
+                        if re_dir == direction:
+                            # Engine still backs our thesis — skip stop loss this cycle
+                            try:
+                                conn_d = db_connect()
+                                conn_d.execute(
+                                    "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+                                    (defer_key, str(defer_count + 1), now_cst().isoformat())
+                                )
+                                conn_d.commit()
+                                conn_d.close()
+                            except Exception:
+                                pass
+                            print(f"[EXIT] {coin}: stop_loss deferred ({defer_count+1}/2) — rules engine still says {direction} ({secs_left}s left, {unreal_pct:+.0f}%)")
+                            deferred = True
+                        else:
+                            print(f"[EXIT] {coin}: stop_loss confirmed — rules engine says {re_dir or 'no signal'} (was {direction}), firing")
+                    else:
+                        print(f"[EXIT] {coin}: stop_loss firing — max deferrals reached ({defer_count})")
+
+                if not deferred:
+                    reason = f"stop_loss ({unreal_pct:+.0f}% <= -{stop_loss_pct:.0f}%)"
 
             # Rule 3: Time cliff — exit any winning position in last N seconds
             elif secs_left <= time_cliff_secs and unreal > 0:
@@ -408,6 +571,9 @@ def check_exit_positions():
                     audit("position_exited", "live_orders", str(lo_id),
                           {"coin": coin, "direction": direction, "contracts": n,
                            "entry": avg_p, "exit": cur_bid, "pnl": exit_pnl, "reason": reason})
+                    # If exiting at high value, buy cheap reversal hedge
+                    if hedge_enabled and cur_bid >= exit_price_target:
+                        buy_reversal_hedge(coin, ticker, direction, wts, yes_bid, yes_ask)
                 else:
                     print(f"[EXIT] {coin}: sell order failed — {err}")
                 conn2.close()
@@ -577,14 +743,30 @@ def live_order_sync_loop():
             sync_live_orders()
             sync_kalshi_balance()
             check_exit_positions()
+            check_lottery_buys()
+            # Adaptive interval: fast (10s) when there's an active order this window,
+            # slow (60s) when idle — no point hammering the API between decisions
+            wts = kalshi_window_ts()
+            conn = db_connect()
+            active = conn.execute(
+                "SELECT 1 FROM live_orders WHERE window_ts=? AND status IN ('placed','filled','executed','filled_partial') AND exit_at IS NULL LIMIT 1",
+                (wts,)
+            ).fetchone()
+            conn.close()
+            interval = 10 if active else 60
         except Exception as e:
             print(f"[LIVE SYNC LOOP] {e}")
-        time.sleep(60)
+            interval = 30
+        time.sleep(interval)
 
 # ── Kalshi order book liquidity ─────────────────────────────────────────────────
 _ob_cache = {}   # ticker -> (fetched_ts, orderbook_fp dict)
 _ob_lock  = threading.Lock()
 _pool_last_placed_wts = 0   # prevents duplicate pool orders in the same window
+_retry_coins: dict = {}     # coin -> wts: coins queued for mid-window retry (module-level so dashboard can read it)
+_pre_signals: dict = {}     # coin -> {direction, confidence, entry, rationale, computed_at}
+_lottery_placed: dict = {}  # (coin, wts) -> True: prevent duplicate lottery buys
+RETRY_CUTOFF = 300          # stop retrying inside final 5 min of window
 # (local LLM semaphore removed — dual MiniMax replaces local 35B subprocess)
 
 def fetch_orderbook(ticker):
@@ -620,22 +802,6 @@ def get_available_contracts(ticker, direction, entry):
             continue
     return available, True
 
-def fetch_kalshi_comments(ticker, coin):
-    """Fetch recent market comments from Kalshi and cache in _kalshi_comments."""
-    try:
-        data = kalshi_get(f"/markets/{ticker}/comments?limit=20")
-        if not data:
-            return
-        comments = data.get("comments", [])
-        snippets = []
-        for c in comments:
-            text = (c.get("content") or c.get("body") or "").strip()
-            if text and len(text) > 5:
-                snippets.append(text[:120])
-        with _state_lock:
-            _kalshi_comments[coin] = snippets[:10]
-    except Exception:
-        pass
 
 def fetch_kalshi_order_book(ticker):
     """Return a human-readable order book depth summary for the LLM prompt."""
@@ -698,6 +864,8 @@ def db_migrate(conn):
         for col, typedef in [
             ("pnl", "REAL"), ("actual_direction", "TEXT"), ("resolved_at", "TEXT"),
             ("exit_price", "REAL"), ("exit_at", "TEXT"), ("exit_reason", "TEXT"),
+            ("is_hedge", "INTEGER"),
+            ("is_lottery", "INTEGER"),
         ]:
             if col not in lo_cols:
                 conn.execute(f"ALTER TABLE live_orders ADD COLUMN {col} {typedef}")
@@ -817,7 +985,9 @@ def db_init():
             entry REAL NOT NULL,
             confidence REAL,
             rationale TEXT,
-            decided_at TEXT
+            decided_at TEXT,
+            retried_at TEXT,
+            retry_count INTEGER DEFAULT 0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_uniq ON decisions(coin, window_ts);
 
@@ -898,6 +1068,13 @@ def db_init():
         );
     """)
 
+    # Migrations — add columns to existing DBs
+    for col, defn in [("retried_at", "TEXT"), ("retry_count", "INTEGER DEFAULT 0")]:
+        try:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {defn}")
+        except Exception:
+            pass  # column already exists
+
     # Seed system_state row
     conn.execute("""
         INSERT OR IGNORE INTO system_state (id, initialized_at, updated_at)
@@ -910,13 +1087,26 @@ def db_init():
     """, (now_cst().isoformat(),))
 
     # Seed default filter settings (won't overwrite existing values)
-    for k, v in [("min_confidence", "0.55"), ("min_volume", "500"),
+    for k, v in [("min_confidence", "0.55"), ("min_volume", "100"),
                  ("exit_take_profit_pct", "40"), ("exit_stop_loss_pct", "65"),
                  ("exit_time_cliff_secs", "90"), ("exit_llm_check", "1"),
+                 ("exit_hard_tp_pct", "80"),
                  ("pool_multi_threshold", "0"),
                  ("blackout_hours", "8,10,11,17,18,23"),
                  ("autopause_wr_threshold", "0.42"),
-                 ("poly_tracked_wallets", "")]:
+                 ("poly_tracked_wallets", ""),
+                 ("recovery_enabled", "0"),
+                 ("recovery_threshold_cents", "5"),
+                 ("recovery_max_contracts", "20"),
+                 ("recovery_live_enabled", "0"),
+                 ("hedge_enabled", "1"),
+                 ("hedge_contracts", "25"),
+                 ("hedge_max_ask_cents", "3"),
+                 ("lottery_enabled", "1"),
+                 ("lottery_contracts", "20"),
+                 ("lottery_max_ask_cents", "2"),
+                 ("lottery_min_secs_left", "60"),
+                 ("lottery_max_secs_left", "300")]:
         conn.execute("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?,?,?)",
                      (k, v, now_cst().isoformat()))
 
@@ -927,7 +1117,27 @@ def db_init():
             (coin, STARTING_CAPITAL, now_cst().isoformat())
         )
 
-    # Migrate live_orders to correct schema if it has wrong columns (Clyde's version)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS recovery_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            lo_id           INTEGER,
+            coin            TEXT,
+            window_ts       INTEGER,
+            ticker          TEXT,
+            direction       TEXT,
+            threshold_ask   REAL,
+            trigger_ask     REAL,
+            contracts       INTEGER,
+            cost            REAL,
+            pnl             REAL,
+            result          TEXT DEFAULT 'PENDING',
+            is_paper        INTEGER DEFAULT 1,
+            created_at      TEXT,
+            resolved_at     TEXT
+        )
+    """)
+
+        # Migrate live_orders to correct schema if it has wrong columns (Clyde's version)
     lo_cols = [r[1] for r in conn.execute("PRAGMA table_info(live_orders)").fetchall()]
     if "window_ts" not in lo_cols:
         conn.execute("DROP TABLE IF EXISTS live_orders")
@@ -1030,12 +1240,47 @@ def audit(event_type, object_type="", object_id="", payload=None, actor="system"
 
 # ── In-memory state ─────────────────────────────────────────────────────────────
 _state_lock    = threading.Lock()
+
+# ── Live log ring buffer ─────────────────────────────────────────────────────
+import collections as _collections
+# Each entry is (seq, text). seq is monotonically increasing so SSE clients
+# can track exactly which lines are new, even after the deque wraps.
+_log_ring: _collections.deque = _collections.deque(maxlen=200)
+_log_seq: int = 0
+
+# Recovery watcher state
+_recovery_state: dict = {}   # lo_id -> state dict
+_last_mm_input:  dict = {}   # coin -> (ticks_summary_hash, result) — skip LLM if market unchanged
+_recovery_lock  = threading.Lock()                # total lines ever appended (never resets)
+_log_subscribers: list = []      # list of threading.Event, one per SSE client
+_log_lock = threading.Lock()
+
+_builtin_print = print
+def print(*args, **kwargs):
+    """Override print to also push to the live log ring buffer."""
+    _builtin_print(*args, **kwargs)
+    try:
+        sep = kwargs.get('sep', ' ')
+        line = sep.join(str(a) for a in args).strip()
+        if line:
+            global _log_seq
+            ts = now_cst().strftime("%H:%M:%S")
+            entry = f"{ts}  {line}"
+            with _log_lock:
+                _log_seq += 1
+                _log_ring.append((_log_seq, entry))
+                for ev in _log_subscribers:
+                    ev.set()
+    except Exception:
+        pass
+
 _prices        = {}
 _active_mkts   = {}
+_last_known_volume = {}  # coin -> last non-zero 24h volume seen (survives window rollovers)
 _last_collect  = {}
 _poly_mkts     = {}   # coin -> latest polymarket data
 _poly_wallets  = {}   # wallet_addr -> {coin, direction, size, ts} — copy-trading signals
-_kalshi_comments = {}  # coin -> list of recent comment strings
+_okx_data      = {}   # coin -> {funding_rate, oi, oi_prev, oi_change_pct, ts}
 _health_status = {}   # key -> {ok, msg, ts}
 
 # ── Price collection ────────────────────────────────────────────────────────────
@@ -1105,7 +1350,7 @@ def find_active_market(coin):
         "yes_bid": _price("yes_bid_dollars", "yes_bid"),
         "yes_ask": _price("yes_ask_dollars", "yes_ask"),
         "last_price": _price("last_price_dollars", "last_price"),
-        "volume": m.get("volume_fp") or m.get("volume", 0),
+        "volume": float(m.get("volume_fp") or m.get("open_interest_fp") or m.get("volume_24h_fp") or m.get("volume_24h") or 0),  # contract total volume — best fill-likelihood signal
     }
 
 def kalshi_window_ts():
@@ -1124,7 +1369,12 @@ def collect_kalshi():
                     m = find_active_market(coin)
                     if not m:
                         continue
+                    cur_vol = m.get("volume", 0) or 0
                     with _state_lock:
+                        # Carry forward last known volume when new window hasn't traded yet
+                        if cur_vol > 0:
+                            _last_known_volume[coin] = cur_vol
+                        display_vol = cur_vol if cur_vol > 0 else _last_known_volume.get(coin, 0)
                         _active_mkts[coin] = {
                             "ticker": m["ticker"],
                             "window_ts": wts,
@@ -1133,6 +1383,7 @@ def collect_kalshi():
                             "last_price": m["last_price"],
                             "secs_left": secs_left,
                             "coin_price": _prices.get(coin),
+                            "volume": display_vol,
                         }
                         _last_collect[coin] = ts
                     conn.execute("""
@@ -1142,9 +1393,6 @@ def collect_kalshi():
                     """, (coin, wts, m["ticker"], m["yes_bid"], m["yes_ask"],
                           m["last_price"], secs_left, _prices.get(coin), ts))
                     ok_count += 1
-                    # Fetch comments every ~5 minutes (every 5th collect cycle)
-                    if ts % 300 < 65:
-                        fetch_kalshi_comments(m["ticker"], coin)
                     time.sleep(0.5)
                 except Exception as e:
                     print(f"[KALSHI] {coin}: {e}")
@@ -1157,7 +1405,21 @@ def collect_kalshi():
             print(f"[KALSHI] Collection error: {e}")
             with _state_lock:
                 _health_status["kalshi"] = {"ok": False, "msg": str(e), "ts": int(time.time())}
-        time.sleep(60)
+        # Sleep until next window boundary (so collector is ready the moment a new window opens)
+        try:
+            wts = kalshi_window_ts()
+            ts_now = int(time.time())
+            secs_to_next = wts + 900 - ts_now
+            conn = db_connect()
+            active = conn.execute(
+                "SELECT 1 FROM live_orders WHERE window_ts=? AND status IN ('placed','filled','executed','filled_partial') AND exit_at IS NULL LIMIT 1",
+                (wts,)
+            ).fetchone()
+            conn.close()
+            sleep_secs = 10 if active else max(2, min(60, secs_to_next))
+            time.sleep(sleep_secs)
+        except Exception:
+            time.sleep(60)
 
 # ── Polymarket copy-trading wallet discovery ────────────────────────────────────
 POLY_COPY_SEED = [
@@ -1336,6 +1598,97 @@ POLY_COIN_KEYWORDS = {
     "XRP": ["xrp", "ripple"],
 }
 
+OKX_INST = {
+    "BTC":  "BTC-USD-SWAP",
+    "ETH":  "ETH-USD-SWAP",
+    "SOL":  "SOL-USD-SWAP",
+    "XRP":  "XRP-USD-SWAP",
+    "DOGE": "DOGE-USD-SWAP",
+    "BNB":  "BNB-USDT-SWAP",
+    "HYPE": None,   # no perpetual futures on OKX
+}
+
+def collect_okx():
+    """Collect OKX funding rate, long/short ratio, OI, and taker buy/sell volume every 60s."""
+    OKX_BASE = "https://www.okx.com/api/v5"
+    def _get(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "autobet/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+
+    while True:
+        for coin, inst in OKX_INST.items():
+            if not inst:
+                continue
+            try:
+                # 1. Funding rate
+                fr = None
+                try:
+                    d = _get(f"{OKX_BASE}/public/funding-rate?instId={inst}")
+                    fr = float(d["data"][0]["fundingRate"]) if d.get("data") else None
+                except Exception:
+                    pass
+
+                # 2. Long/short account ratio (last 3 x 5min bars)
+                ls_ratio = None
+                ls_trend = None
+                try:
+                    d = _get(f"{OKX_BASE}/rubik/stat/contracts/long-short-account-ratio?ccy={coin}&period=5m")
+                    rows = d.get("data", [])
+                    if rows:
+                        ls_ratio = float(rows[0][1])   # current: longs/shorts ratio
+                        if len(rows) >= 3:
+                            ls_prev = float(rows[2][1])
+                            ls_trend = ls_ratio - ls_prev  # positive = more longs building
+                except Exception:
+                    pass
+
+                # 3. Taker buy/sell volume (last 3 x 5min bars)
+                taker_buy = None
+                taker_sell = None
+                taker_ratio = None
+                try:
+                    d = _get(f"{OKX_BASE}/rubik/stat/taker-volume?ccy={coin}&instType=CONTRACTS&period=5m")
+                    rows = d.get("data", [])
+                    if rows:
+                        # Sum last 3 bars for more stable signal
+                        buy_sum  = sum(float(r[1]) for r in rows[:3])
+                        sell_sum = sum(float(r[2]) for r in rows[:3])
+                        taker_buy  = buy_sum
+                        taker_sell = sell_sum
+                        taker_ratio = buy_sum / sell_sum if sell_sum > 0 else None
+                except Exception:
+                    pass
+
+                # 4. Open interest change
+                oi_chg = None
+                try:
+                    d = _get(f"{OKX_BASE}/rubik/stat/contracts/open-interest-volume?ccy={coin}&period=5m")
+                    rows = d.get("data", [])
+                    if len(rows) >= 2:
+                        oi_now  = float(rows[0][1])
+                        oi_prev = float(rows[1][1])
+                        oi_chg  = (oi_now - oi_prev) / oi_prev * 100 if oi_prev > 0 else None
+                except Exception:
+                    pass
+
+                with _state_lock:
+                    _okx_data[coin] = {
+                        "funding_rate":  fr,
+                        "ls_ratio":      ls_ratio,
+                        "ls_trend":      ls_trend,
+                        "taker_ratio":   taker_ratio,
+                        "taker_buy":     taker_buy,
+                        "taker_sell":    taker_sell,
+                        "oi_change_pct": oi_chg,
+                        "ts":            int(time.time()),
+                    }
+                print(f"[OKX] {coin}: fr={fr:.5f} ls={ls_ratio:.2f} taker={taker_ratio:.2f} oi_chg={oi_chg:+.2f}%" if all(x is not None for x in [fr, ls_ratio, taker_ratio, oi_chg]) else f"[OKX] {coin}: partial data")
+            except Exception:
+                pass
+        time.sleep(60)
+
+
 def collect_polymarket():
     while True:
         try:
@@ -1419,26 +1772,28 @@ def check_risk(coin, direction, entry, size):
     rs = get_risk_settings()
     if rs["kill_switch"]:
         return False, "Kill switch is active — all trading halted"
-    if size > rs["max_stake"]:
-        return False, f"Size ${size:.2f} exceeds max stake ${rs['max_stake']:.2f}"
     if entry < ENTRY_FLOOR:
         return False, f"Entry {entry:.4f} below floor {ENTRY_FLOOR} — unrealistic liquidity (lottery ticket)"
     if entry > ENTRY_CEILING:
         return False, f"Entry {entry:.4f} above ceiling {ENTRY_CEILING} — confirmed negative EV across all coins"
+    if size > rs["max_stake"]:
+        return False, f"SIZE_CLIP:{rs['max_stake']:.2f}"  # caller clips to max_stake instead of blocking
     # Get run-reset timestamp — guardrail counters only look at trades AFTER last reset
     conn = db_connect()
     reset_row = conn.execute("SELECT value FROM settings WHERE key=?", (f"cooldown_reset_{coin}",)).fetchone()
     conn.close()
     reset_after = reset_row[0] if reset_row else "2000-01-01"
 
-    # Daily loss check (only trades since today AND since last run reset)
+    # Daily loss check — live trades only (paper losses don't risk real capital)
     try:
         today_str = now_cst().strftime("%Y-%m-%d")
         conn = db_connect()
         row = conn.execute("""
             SELECT COALESCE(SUM(pnl),0) FROM paper_trades
             WHERE coin=? AND result='LOSS'
-              AND resolved_at >= ? AND resolved_at >= ?
+              AND date(resolved_at) = ?
+              AND resolved_at >= ?
+              AND kalshi_order_id IS NOT NULL
         """, (coin, today_str, reset_after)).fetchone()
         daily_loss = abs(float(row[0])) if row else 0.0
         conn.close()
@@ -1560,13 +1915,14 @@ def get_price_at(conn, coin, ts, tol=120):
 
 def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=None,
                     rules_signal=None, knn_signal=None, price_momentum=None,
-                    poly_price=None, prev_outcomes=None, fee_note=None):
+                    poly_price=None, poly_question=None, poly_volume=None, poly_age=None,
+                    prev_outcomes=None, fee_note=None, betbot_signal=None):
     if not MINIMAX_KEY:
         return None
     vol_line = ""
     if market_volume is not None:
         vol_activity = "HIGH" if market_volume >= 2000 else ("MODERATE" if market_volume >= 500 else "LOW")
-        vol_line = f"\n24h market volume: {int(market_volume):,} contracts ({vol_activity} activity)"
+        vol_line = f"\nMarket volume: ${int(market_volume):,} ({vol_activity} activity)"
     spread_line = ""
     if spread is not None:
         spread_line = f"\nCurrent bid-ask spread: {spread:.3f} ({'tight' if spread < 0.05 else 'wide — slippage risk'})"
@@ -1607,6 +1963,14 @@ def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=
         elif pct < -0.15:
             agreement_count["NO"] += 1
 
+    if betbot_signal:
+        bb_dir  = betbot_signal.get("direction", "PASS")
+        bb_e    = betbot_signal.get("entry", 0)
+        bb_conf = betbot_signal.get("confidence", 0.75)
+        engine_lines.append(f"- Autoresearch:    {bb_dir:4s}  entry={bb_e:.3f}  conf={bb_conf:.2f}  (evolved strategy, betbot M2.7 loop)")
+        if bb_dir in ("YES", "NO"):
+            agreement_count[bb_dir] += 1
+
     # Consensus summary
     yes_n, no_n = agreement_count["YES"], agreement_count["NO"]
     if yes_n >= 2 and no_n == 0:
@@ -1629,11 +1993,22 @@ def minimax_analyze(coin, ticks_summary, coin_price, market_volume=None, spread=
             kalshi_mid_est = rules_mid or 0.5
             diff = poly_price - kalshi_mid_est
             arb_note = f"arb gap {abs(diff):.3f}" if abs(diff) > 0.05 else "aligned with Kalshi"
-            engine_lines.append(f"- Polymarket:      YES={poly_price:.3f}  ({arb_note})")
-            if poly_price > 0.62:
-                agreement_count["YES"] += 1
-            elif poly_price < 0.38:
-                agreement_count["NO"] += 1
+            # Build context notes
+            age_note = f", {poly_age}s old" if poly_age is not None else ""
+            vol_note = f", vol=${poly_volume:,.0f}" if poly_volume else ", vol=unknown"
+            q_note   = f' | market: "{poly_question}"' if poly_question else ""
+            # Detect if this is likely a long-term market (won't match 15min window)
+            long_term_kws = ["month", "year", "week", "quarter", "2025", "2026", "reach", "ever", "all time"]
+            is_long_term = any(kw in (poly_question or "").lower() for kw in long_term_kws)
+            stale = poly_age is not None and poly_age > 300  # >5 min old
+            quality = "⚠ long-term market — different question than Kalshi 15min" if is_long_term else ("⚠ stale data" if stale else arb_note)
+            engine_lines.append(f"- Polymarket:      YES={poly_price:.3f}  ({quality}{age_note}{vol_note}){q_note}")
+            # Only count toward agreement if it's a plausible short-term market and fresh
+            if not is_long_term and not stale:
+                if poly_price > 0.62:
+                    agreement_count["YES"] += 1
+                elif poly_price < 0.38:
+                    agreement_count["NO"] += 1
         except Exception:
             pass
 
@@ -1682,7 +2057,7 @@ Respond with JSON only:
                 MINIMAX_URL, data=payload,
                 headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
             )
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 resp = json.loads(r.read().decode())
                 text = ""
                 for block in resp.get("content", []):
@@ -1714,11 +2089,12 @@ Respond with JSON only:
                             "suggest_engine": sug_m.group(1) if sug_m else None,
                         }
         except Exception as e:
-            print(f"[MINIMAX] {coin}: {e}")
+            print(f"[MINIMAX] {coin}: primary error — {type(e).__name__}: {e}")
 
     def _call_minimax2():
         """Second independent MiniMax call — adversarial framing, higher temperature."""
         try:
+            time.sleep(1)  # stagger 1s to reduce parallel API load
             adversarial_prompt = (
                 prompt.replace(
                     "Synthesize all available signals and make the final trading decision.",
@@ -1735,7 +2111,7 @@ Respond with JSON only:
                 MINIMAX_URL, data=payload,
                 headers={"Content-Type": "application/json", "x-api-key": MINIMAX_KEY, "anthropic-version": "2023-06-01"}
             )
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=60) as r:
                 resp = json.loads(r.read().decode())
                 text = ""
                 for block in resp.get("content", []):
@@ -1766,14 +2142,26 @@ Respond with JSON only:
                             "suggest_engine": None,
                         }
         except Exception as e:
-            print(f"[MINIMAX2] {coin}: {e}")
+            print(f"[MINIMAX2] {coin}: skeptic error — {type(e).__name__}: {e}")
 
+    # Strong consensus from pre-computed engines → skip skeptic (saves API call)
+    _strong = (yes_n >= 2 and no_n == 0) or (no_n >= 2 and yes_n == 0)
+
+    # Cache check — if order book snapshot identical to last call, reuse result
+    import hashlib as _hl
+    _snap_hash = _hl.md5((ticks_summary + str(round(coin_price, 1))).encode()).hexdigest()
+    _cached = _last_mm_input.get(coin)
+    if _cached and _cached[0] == _snap_hash:
+        print(f"[MINIMAX] {coin}: market unchanged — reusing last decision")
+        return _cached[1]
     t_mm  = _threading.Thread(target=_call_minimax,  daemon=True)
     t_loc = _threading.Thread(target=_call_minimax2, daemon=True)
     t_mm.start()
-    t_loc.start()
-    t_mm.join(timeout=125)
-    t_loc.join(timeout=125)
+    if not _strong:
+        t_loc.start()
+    t_mm.join(timeout=65)
+    if not _strong:
+        t_loc.join(timeout=68)
 
     mm = results.get("minimax")
     lo = results.get("minimax2")
@@ -1785,6 +2173,11 @@ Respond with JSON only:
     if lo and lo.get("direction") not in ("YES", "NO"):
         lo = None
 
+    def _cache_and_return(res):
+        if res:
+            _last_mm_input[coin] = (_snap_hash, res)
+        return res
+
     if mm and lo:
         mm_dir, lo_dir = mm.get("direction"), lo.get("direction")
         mm_conf, lo_conf = float(mm.get("confidence", 0.5)), float(lo.get("confidence", 0.5))
@@ -1793,20 +2186,30 @@ Respond with JSON only:
             mm["confidence"] = boosted
             mm["rationale"]  = mm["rationale"].rstrip(".") + f" [skeptic agrees {lo_conf:.2f}↑]"
             print(f"[DUAL LLM] {coin}: AGREE {mm_dir} mm={mm_conf:.2f} skeptic={lo_conf:.2f} → {boosted:.2f}")
+            return _cache_and_return(mm)
         else:
             penalized = round(mm_conf * 0.65, 4)
             mm["confidence"] = penalized
             mm["rationale"]  = mm["rationale"].rstrip(".") + f" [skeptic disagrees: {lo_dir} {lo_conf:.2f}↓]"
             print(f"[DUAL LLM] {coin}: DISAGREE mm={mm_dir}({mm_conf:.2f}) skeptic={lo_dir}({lo_conf:.2f}) → penalized to {penalized:.2f}")
+            return _cache_and_return(mm)
         result = mm
     elif mm:
         print(f"[DUAL LLM] {coin}: primary only (skeptic timed out)")
+        return _cache_and_return(mm)
         result = mm
     elif lo:
         print(f"[DUAL LLM] {coin}: skeptic only (primary failed)")
         lo["rationale"] = lo.get("rationale","").rstrip(".") + " [skeptic only]"
+        return _cache_and_return(lo)
         result = lo
     else:
+        # Both LLMs timed out — fall back to rules engine
+        fallback = rules_signal
+        if fallback:
+            fallback["rationale"] = fallback.get("rationale", "") + " [LLM timeout — rules fallback]"
+            print(f"[DUAL LLM] {coin}: both timed out, rules fallback → {fallback.get('direction')} conf={fallback.get('confidence'):.2f}")
+            return fallback
         return None
 
     sug = result.get("suggest_engine")
@@ -1954,20 +2357,303 @@ def resolve_live_orders():
                "actual": actual_direction, "result": result_str, "pnl": pnl})
 
 
+def run_pre_signals():
+    """Fire MiniMax for live coins ~60s before window opens. Stores in _pre_signals."""
+    global _pre_signals
+    try:
+        conn = db_connect()
+        live_set = {r[0] for r in conn.execute("SELECT coin FROM coin_modes WHERE mode='live'").fetchall()}
+        conn.close()
+        live_coins = [c for c in COINS if c in live_set]
+        if not live_coins:
+            return
+        wts = kalshi_window_ts()
+        now = int(time.time())
+        with _state_lock:
+            mkts = {k: dict(v) for k, v in _active_mkts.items()}
+            prices = dict(_prices)
+        def _pre_one(coin):
+            try:
+                mkt = mkts.get(coin)
+                coin_price = prices.get(coin)
+                if not mkt or not coin_price:
+                    return
+                prev_wts = wts - 900
+                conn2 = db_connect()
+                ticks = get_recent_ticks(conn2, coin, prev_wts, n=10)
+                conn2.close()
+                ticks_summary = format_ticks_summary(ticks)
+                market_volume = float(mkt.get("volume") or 0)
+                yes_bid = float(mkt.get("yes_bid") or 0)
+                yes_ask = float(mkt.get("yes_ask") or 0)
+                spread = round(yes_ask - yes_bid, 4) if yes_bid and yes_ask else None
+                engine_key = get_engine_for_coin(coin)
+                result = run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary,
+                                    market_volume=market_volume, spread=spread)
+                if result and result.get("direction") in ("YES", "NO") and result.get("confidence", 0) >= 0.55:
+                    _pre_signals[coin] = {
+                        "direction":  result["direction"],
+                        "confidence": result["confidence"],
+                        "entry":      result.get("entry", yes_ask),
+                        "rationale":  result.get("rationale", ""),
+                        "computed_at": now,
+                    }
+                    print(f"[PRE] {coin}: {result['direction']} conf={result['confidence']:.2f} entry={result.get('entry',0):.3f}")
+            except Exception as e:
+                print(f"[PRE] {coin} error: {e}")
+        threads = [threading.Thread(target=_pre_one, args=(c,), daemon=True) for c in live_coins]
+        for t in threads: t.start()
+        for t in threads: t.join(timeout=90)
+    except Exception as e:
+        print(f"[PRE] run_pre_signals error: {e}")
+
+
+def pre_signal_loop():
+    """Thread: fires run_pre_signals ~65s before each window boundary."""
+    time.sleep(30)
+    _fired_for_wts = 0
+    while True:
+        try:
+            wts = kalshi_window_ts()
+            ts_now = int(time.time())
+            secs_to_next = wts + 900 - ts_now
+            next_wts = wts + 900
+            if 55 <= secs_to_next <= 80 and _fired_for_wts < next_wts:
+                _fired_for_wts = next_wts
+                print(f"[PRE] Firing pre-signals {secs_to_next:.0f}s before wts={next_wts}")
+                run_pre_signals()
+                time.sleep(90)
+                continue
+        except Exception as e:
+            print(f"[PRE] loop error: {e}")
+        time.sleep(5)
+
+
+def check_lottery_buys():
+    """Buy cheap reversal contracts in the last 5 min of a window."""
+    global _lottery_placed
+    try:
+        conn = db_connect()
+        def _s(k, d):
+            r = conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+            return float(r[0]) if r else d
+        enabled       = _s("lottery_enabled", 1.0)
+        lot_contracts = int(_s("lottery_contracts", 20))
+        max_ask_cts   = _s("lottery_max_ask_cents", 2.0)
+        min_secs_left = _s("lottery_min_secs_left", 60.0)
+        max_secs_left = _s("lottery_max_secs_left", 300.0)
+        conn.close()
+        if not enabled:
+            return
+        wts = kalshi_window_ts()
+        ts_now = int(time.time())
+        secs_left = wts + 900 - ts_now
+        if not (min_secs_left <= secs_left <= max_secs_left):
+            return
+        with _state_lock:
+            mkts = {k: dict(v) for k, v in _active_mkts.items()}
+        for coin in COINS:
+            key = (coin, wts)
+            if _lottery_placed.get(key):
+                continue
+            mkt = mkts.get(coin, {})
+            if not mkt or mkt.get("window_ts") != wts:
+                continue
+            yes_bid = float(mkt.get("yes_bid") or 0)
+            yes_ask = float(mkt.get("yes_ask") or 0)
+            if not yes_bid or not yes_ask:
+                continue
+            no_ask = 1.0 - yes_bid
+            if yes_ask <= (max_ask_cts / 100.0):
+                buy_side, ask_price = "YES", yes_ask
+            elif no_ask <= (max_ask_cts / 100.0):
+                buy_side, ask_price = "NO", no_ask
+            else:
+                continue
+            ticker = mkt.get("ticker")
+            if not ticker:
+                continue
+            limit_cts = max(1, min(int(max_ask_cts), round(ask_price * 100) + 1))
+            body = {
+                "ticker": ticker,
+                "client_order_id": f"autobet_lottery_{ticker}_{int(time.time())}",
+                "type": "limit", "action": "buy",
+                "side": buy_side.lower(), "count": lot_contracts,
+                "yes_price": limit_cts if buy_side == "YES" else (100 - limit_cts),
+            }
+            resp, err = kalshi_post("/portfolio/orders", body)
+            if err:
+                print(f"[LOTTERY] {coin}: order failed — {err}")
+                continue
+            order_id = (resp or {}).get("order", {}).get("order_id")
+            if not order_id:
+                continue
+            conn2 = db_connect()
+            conn2.execute("""
+                INSERT INTO live_orders
+                    (coin, window_ts, ticker, direction, contracts, limit_price, order_id, status, is_lottery, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'placed', 1, ?)
+            """, (coin, wts, ticker, buy_side, lot_contracts, limit_cts, order_id, now_cst().isoformat()))
+            conn2.commit()
+            conn2.close()
+            _lottery_placed[key] = True
+            print(f"[LOTTERY] {coin}: bought {lot_contracts} {buy_side} @ {limit_cts}¢ ({secs_left:.0f}s left)")
+    except Exception as e:
+        print(f"[LOTTERY] error: {e}")
+
+
 def decision_loop():
-    global _pool_last_placed_wts
+    global _pool_last_placed_wts, _retry_coins
     time.sleep(10)
     last_decided_wts = 0
+    retry_coins = _retry_coins  # use module-level so decisions page can read it
     while True:
         try:
             wts = kalshi_window_ts()
             now = int(time.time())
             secs_into = now - wts
+            secs_left = 900 - secs_into
+
+            # Mid-window retry race
+            # After the normal decision window (180s in), keep re-running a full race every loop
+            # until 5 min left (300s). Clears blocking PASSes each pass so _decide_coin can
+            # re-evaluate fresh prices. Stops retrying once an order is placed this window or
+            # time runs out. retry_coins tracks coins that got a retriable PASS (floor/ceiling/conf).
+            # Expire stale entries from previous windows first.
+            for rcoin in list(retry_coins.keys()):
+                if retry_coins[rcoin] != wts:
+                    del retry_coins[rcoin]
+
+
+            if (retry_coins and secs_left >= RETRY_CUTOFF
+                    and wts == last_decided_wts  # normal decision already ran this window
+                    and _pool_last_placed_wts < wts):  # no order placed yet
+                # Mark blocking PASSes as retrying — keeps them visible on dashboard while re-race runs
+                conn_r = db_connect()
+                n_marked = 0
+                retry_ts = now_cst().isoformat()
+                for rcoin in COINS:
+                    row_r = conn_r.execute("""
+                        SELECT rationale, retry_count FROM decisions
+                        WHERE coin=? AND window_ts=? AND direction='PASS'
+                    """, (rcoin, wts)).fetchone()
+                    if not row_r:
+                        continue
+                    rat_r, rcount = row_r
+                    # Strip previous [retrying ...] prefix if present
+                    import re as _re
+                    rat_clean = _re.sub(r'^\[retrying[^\]]*\]\s*', '', rat_r or '')
+                    retriable_kws = ("Entry", "Conf PASS", "Risk block", "no engine signal", "Volume PASS", "fallback")
+                    if not any(kw in rat_clean for kw in retriable_kws):
+                        continue
+                    new_rat = f"[retrying] {rat_clean}"
+                    cur = conn_r.execute("""
+                        UPDATE decisions SET rationale=?, retried_at=?, retry_count=COALESCE(retry_count,0)+1
+                        WHERE coin=? AND window_ts=? AND direction='PASS'
+                    """, (new_rat, retry_ts, rcoin, wts))
+                    n_marked += cur.rowcount
+                conn_r.commit()
+                conn_r.close()
+                coins_str = ", ".join(f"{c}" for c in retry_coins)
+                print(f"[RETRY] Re-race at {secs_left}s left — marked {n_marked} PASSes retrying ({coins_str})")
+
+                # Fresh full race — same pool infrastructure as normal decision window
+                _retry_pool_signals = {}
+                _retry_pool_lock = threading.Lock()
+
+                def _retry_decide(coin, api_delay=0):
+                    _decide_coin(coin, wts, now, pool_signals=_retry_pool_signals,
+                                 pool_lock=_retry_pool_lock, api_delay=api_delay)
+
+                _conn_rl = db_connect()
+                _live_set_r = {r[0] for r in _conn_rl.execute(
+                    "SELECT coin FROM coin_modes WHERE mode='live'"
+                ).fetchall()}
+                _conn_rl.close()
+                live_coins_r  = [c for c in COINS if c in _live_set_r]
+                paper_coins_r = [c for c in COINS if c not in _live_set_r]
+                rthreads = (
+                    [threading.Thread(target=_retry_decide,
+                                      args=(coin,), daemon=True)
+                     for coin in live_coins_r] +
+                    [threading.Thread(target=_retry_decide,
+                                      args=(coin,), daemon=True)
+                     for coin in paper_coins_r]
+                )
+                for t in rthreads: t.start()
+                for t in rthreads: t.join(timeout=min(120, secs_left - RETRY_CUTOFF))
+
+                if _retry_pool_signals:
+                    print(f"[RETRY] Race signals: "
+                          + ", ".join(f"{c}:{v['direction']}@{v['entry']:.3f} conf={v['confidence']:.2f}"
+                                      for c, v in _retry_pool_signals.items()))
+                    try:
+                        conn_rp = db_connect()
+                        global_live_r = conn_rp.execute(
+                            "SELECT global_live_enabled FROM system_state WHERE id=1"
+                        ).fetchone()
+                        live_on_r = global_live_r and global_live_r[0]
+
+                        if live_on_r:
+                            def rolling_wr_r(c):
+                                rows = conn_rp.execute(
+                                    "SELECT result FROM paper_trades WHERE coin=? AND result IN ('WIN','LOSS') ORDER BY window_ts DESC LIMIT 10",
+                                    (c,)
+                                ).fetchall()
+                                if len(rows) < 3: return 0.5
+                                return sum(1 for r in rows if r[0]=='WIN') / len(rows)
+
+                            scored_r = sorted(
+                                [(c, _retry_pool_signals[c]['confidence'] * 0.7 + rolling_wr_r(c) * 0.3)
+                                 for c in _retry_pool_signals],
+                                key=lambda x: x[1], reverse=True
+                            )
+                            CORR_GROUPS_R = [{"BTC", "ETH"}, {"SOL", "XRP", "DOGE", "BNB", "HYPE"}]
+                            seen_r = set()
+                            deduped_r = []
+                            for c, s in scored_r:
+                                grp = next((i for i, g in enumerate(CORR_GROUPS_R) if c in g), -1)
+                                if grp >= 0 and grp in seen_r:
+                                    continue
+                                if grp >= 0:
+                                    seen_r.add(grp)
+                                deduped_r.append((c, s))
+
+                            if deduped_r and _pool_last_placed_wts < wts:
+                                best_coin_r, best_score_r = deduped_r[0]
+                                sig_r = _retry_pool_signals[best_coin_r]
+                                order_id_r, used_ticker_r, order_err_r = place_kalshi_order(
+                                    best_coin_r, sig_r['ticker'], sig_r['direction'],
+                                    sig_r['contracts'], sig_r['entry']
+                                )
+                                conn_rp2 = db_connect()
+                                conn_rp2.execute("""
+                                    INSERT INTO live_orders (coin, window_ts, ticker, direction, contracts,
+                                        limit_price, order_id, status, error, created_at)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                                """, (best_coin_r, wts, used_ticker_r, sig_r['direction'], sig_r['contracts'],
+                                      max(1, min(99, round(sig_r['entry']*100))),
+                                      order_id_r, "placed" if order_id_r else "failed",
+                                      order_err_r, now_cst().isoformat()))
+                                conn_rp2.commit()
+                                conn_rp2.close()
+                                _pool_last_placed_wts = wts
+                                print(f"[RETRY] Late entry: {best_coin_r} {sig_r['direction']}@{sig_r['entry']:.3f} "
+                                      f"conf={sig_r['confidence']:.2f} score={best_score_r:.2f} "
+                                      f"order={'OK '+order_id_r if order_id_r else 'FAIL '+str(order_err_r)}")
+                                retry_coins.clear()  # order placed — stop retrying
+                        conn_rp.close()
+                    except Exception as rpe:
+                        print(f"[RETRY] placement error: {rpe}")
+                else:
+                    print(f"[RETRY] No signals from re-race, will retry next loop")
+
             if secs_into > 180:
                 # Still run resolution even when outside decision window
                 try:
                     resolve_trades()
                     resolve_live_orders()
+                    resolve_recovery_trades()
                 except Exception:
                     pass
                 time.sleep(30)
@@ -1975,15 +2661,15 @@ def decision_loop():
             if wts <= last_decided_wts:
                 time.sleep(30)
                 continue
-            def _decide_coin(coin, wts, now, pool_signals=None, pool_lock=None, stale_counter=None, api_delay=0):
+            def _decide_coin(coin, wts, now, pool_signals=None, pool_lock=None, stale_counter=None, api_delay=0, _stale_retry=False):
               try:
                 conn = db_connect()
                 try:
                     existing = conn.execute(
-                        "SELECT id FROM decisions WHERE coin=? AND window_ts=?", (coin, wts)
+                        "SELECT id, direction FROM decisions WHERE coin=? AND window_ts=?", (coin, wts)
                     ).fetchone()
-                    if existing:
-                        return
+                    if existing and existing[1] != 'PASS':
+                        return  # real trade already recorded — don't overwrite
                     with _state_lock:
                         mkt = _active_mkts.get(coin)
                         coin_price = _prices.get(coin)
@@ -1997,12 +2683,16 @@ def decision_loop():
                         print(f"[SKIP] {coin} wts={wts}: no coin price")
                         return
                     # ── Feature 9: Window entry timing delay ────────────────
-                    # Avoid thin early liquidity — wait until at least 60s into window
+                    # Wait 30s for live coins (proven liquidity within seconds), 60s for paper.
+                    # Skip entirely mid-window — if we're retrying we're already 3+ min in.
                     secs_into_window = int(time.time()) - wts
-                    if secs_into_window < 60:
-                        wait_secs = 60 - secs_into_window
-                        print(f"[TIMING] {coin} wts={wts}: waiting {wait_secs}s (only {secs_into_window}s into window)")
-                        time.sleep(wait_secs)
+                    conn_live_chk = db_connect()
+                    is_live_coin = conn_live_chk.execute(
+                        "SELECT mode FROM coin_modes WHERE coin=?", (coin,)
+                    ).fetchone()
+                    conn_live_chk.close()
+                    timing_floor = 0
+                    # Floor removed — volume filter (min_volume=50) handles liquidity gating
 
                     # Stagger MiniMax API calls only — market data already checked above
                     if api_delay:
@@ -2021,16 +2711,17 @@ def decision_loop():
                             "SELECT value FROM settings WHERE key='min_volume'"
                         ).fetchone()[0])
                     except Exception:
-                        min_vol = 500.0
+                        min_vol = 100.0  # 24h volume threshold (was 500 when using total volume)
                     if min_vol > 0 and market_volume > 0 and market_volume < min_vol:
                         conn.execute("""
-                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
                         """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
-                              f"Volume PASS: {int(market_volume)} contracts < {int(min_vol)} threshold",
+                              f"Volume PASS: ${int(market_volume)} < ${int(min_vol)} threshold",
                               now_cst().isoformat()))
                         conn.commit()
                         print(f"[VOLUME] {coin} wts={wts}: PASS — volume {int(market_volume)} < {int(min_vol)}")
+                        retry_coins[coin] = wts  # volume builds during window — retry when it crosses threshold
                         return
 
                     # ── Feature 1: Time-of-day blackout filter (per-coin) ───────────────
@@ -2048,7 +2739,7 @@ def decision_loop():
                             cur_hour = now_cst().hour
                             if cur_hour in blackout:
                                 conn.execute("""
-                                    INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                                    INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                                     VALUES (?,?,?,?,?,?,?)
                                 """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
                                       f"Blackout PASS: hour {cur_hour}:00 CT in blackout list",
@@ -2075,7 +2766,7 @@ def decision_loop():
                                 wr = sum(1 for r in ap_rows if r[0]=='WIN') / len(ap_rows)
                                 if wr < autopause_threshold:
                                     conn.execute("""
-                                        INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                                        INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                                         VALUES (?,?,?,?,?,?,?)
                                     """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
                                           f"AutoPause: {coin} WR {wr:.0%} over last {len(ap_rows)} trades < {autopause_threshold:.0%} threshold",
@@ -2090,7 +2781,7 @@ def decision_loop():
                     secs_left_now = max(0, wts + 900 - int(time.time()))
                     if secs_left_now < 120:
                         conn.execute("""
-                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                             VALUES (?,?,?,?,?,?,?)
                         """, (coin, wts, "PASS", round(yes_ask_v, 4), 0.0,
                               f"Timing PASS: only {secs_left_now}s left in window (< 120s entry block)",
@@ -2101,9 +2792,12 @@ def decision_loop():
 
                     # ── Feature 2: Polymarket cross-venue signal ─────────────
                     with _state_lock:
-                        poly_price = _poly_mkts.get(coin, {}).get("yes_price")
+                        poly_entry = dict(_poly_mkts.get(coin, {}))
                         wallet_sig = dict(_poly_wallets.get(coin, {}))
-                        comments   = list(_kalshi_comments.get(coin, []))
+                    poly_price    = poly_entry.get("yes_price")
+                    poly_question = poly_entry.get("question", "")
+                    poly_volume   = float(poly_entry.get("volume") or 0)
+                    poly_age      = int(time.time()) - int(poly_entry.get("ts") or 0) if poly_entry.get("ts") else None
 
                     # ── Feature 3: Previous window outcomes ──────────────────
                     prev_outcomes = None
@@ -2147,12 +2841,6 @@ def decision_loop():
                     except Exception:
                         pass
 
-                    # ── Feature 5: Kalshi comment sentiment ──────────────────
-                    if comments:
-                        comment_text = " | ".join(comments[:5])
-                        comment_note = f"Market comments (recent): {comment_text}"
-                        fee_note = (fee_note + "\n" + comment_note) if fee_note else comment_note
-
                     # ── Feature 7: Polymarket copy-trading wallet signals ─────
                     if wallet_sig and (wallet_sig.get("YES", 0) + wallet_sig.get("NO", 0)) > 0:
                         yes_n = wallet_sig.get("YES", 0)
@@ -2166,27 +2854,101 @@ def decision_loop():
                                        f"Wallets: {wallet_sig.get('wallets', [])}")
                         fee_note = (fee_note + "\n" + wallet_note) if fee_note else wallet_note
 
-                    # 1. Try betbot autoresearch signal file first
+                    # ── Feature 9: OKX perp market signals ───────────────────
+                    with _state_lock:
+                        okx = dict(_okx_data.get(coin, {}))
+                    if okx.get("ts") and (int(time.time()) - okx["ts"]) < 180:
+                        fr          = okx.get("funding_rate")
+                        ls_ratio    = okx.get("ls_ratio")
+                        ls_trend    = okx.get("ls_trend")
+                        taker_ratio = okx.get("taker_ratio")
+                        oi_chg      = okx.get("oi_change_pct")
+
+                        # Score each signal: +1 bullish, -1 bearish, 0 neutral
+                        bull = 0; bear = 0
+                        lines = []
+
+                        if fr is not None:
+                            fr_pct = fr * 100
+                            if fr < -0.001:
+                                bull += 1
+                                lines.append(f"funding {fr_pct:.4f}% (shorts paying → bullish)")
+                            elif fr > 0.001:
+                                bear += 1
+                                lines.append(f"funding {fr_pct:.4f}% (longs paying → bearish)")
+                            else:
+                                lines.append(f"funding {fr_pct:.4f}% (neutral)")
+
+                        if ls_ratio is not None:
+                            pct_long = ls_ratio / (1 + ls_ratio) * 100
+                            trend_s = ""
+                            if ls_trend is not None:
+                                trend_s = " building" if ls_trend > 0.05 else " unwinding" if ls_trend < -0.05 else ""
+                            if pct_long > 60:
+                                bear += 1  # crowded long = contrarian bearish
+                                lines.append(f"L/S ratio {ls_ratio:.2f} ({pct_long:.0f}% long{trend_s}, crowded → bearish)")
+                            elif pct_long < 40:
+                                bull += 1
+                                lines.append(f"L/S ratio {ls_ratio:.2f} ({pct_long:.0f}% long{trend_s}, oversold → bullish)")
+                            else:
+                                lines.append(f"L/S ratio {ls_ratio:.2f} ({pct_long:.0f}% long{trend_s})")
+
+                        if taker_ratio is not None:
+                            if taker_ratio > 1.15:
+                                bull += 1
+                                lines.append(f"taker buy/sell {taker_ratio:.2f} (aggressive buyers dominating)")
+                            elif taker_ratio < 0.85:
+                                bear += 1
+                                lines.append(f"taker buy/sell {taker_ratio:.2f} (aggressive sellers dominating)")
+                            else:
+                                lines.append(f"taker buy/sell {taker_ratio:.2f} (balanced)")
+
+                        if oi_chg is not None:
+                            oi_s = f"OI {oi_chg:+.2f}%"
+                            if abs(oi_chg) > 0.5:
+                                lines.append(f"{oi_s} ({'new money entering' if oi_chg > 0 else 'positions closing'})")
+                            else:
+                                lines.append(f"{oi_s} (flat)")
+
+                        if lines:
+                            net = bull - bear
+                            net_s = f"NET: {'+' if net > 0 else ''}{net} ({'bullish lean' if net > 0 else 'bearish lean' if net < 0 else 'mixed'})"
+                            okx_note = "OKX perp signals: " + " | ".join(lines) + f" → {net_s}"
+                            fee_note = (fee_note + "\n" + okx_note) if fee_note else okx_note
+
+                    # Betbot autoresearch signal — folded into minimax as a weighted input
                     bb_dir, bb_entry, bb_size = read_betbot_signal(coin, wts)
-                    if bb_dir:
-                        result = {"direction": bb_dir, "entry": bb_entry,
-                                  "confidence": 0.75, "rationale": "autoresearch signal (evolved strategy)",
-                                  "_betbot_size": bb_size}
+                    bb_sig = {"direction": bb_dir, "entry": bb_entry, "confidence": 0.75} if bb_dir else None
+                    # Use pre-computed signal if fresh (< 120s old), skip slow MiniMax call
+                    _pre = _pre_signals.get(coin)
+                    _eng_key = get_engine_for_coin(coin)
+                    if (_pre and _eng_key == "minimax_llm"
+                            and int(time.time()) - _pre.get("computed_at", 0) < 120):
+                        result = {
+                            "direction":  _pre["direction"],
+                            "confidence": _pre["confidence"],
+                            "entry":      float(mkt.get("yes_ask") or _pre["entry"]),
+                            "rationale":  "[pre-signal] " + _pre["rationale"],
+                        }
+                        print(f"[PRE] {coin}: using pre-signal {_pre['direction']} conf={_pre['confidence']:.2f}")
+                        del _pre_signals[coin]
                     else:
-                        # 2. Use configured engine (minimax_llm / rules / knn / hybrid)
-                        result = run_engine(get_engine_for_coin(coin), coin, mkt, ticks, coin_price, ticks_summary,
-                                            market_volume=market_volume, spread=spread_v,
-                                            poly_price=poly_price, prev_outcomes=prev_outcomes,
-                                            fee_note=fee_note)
+                        result = run_engine(_eng_key, coin, mkt, ticks, coin_price, ticks_summary,
+                                        market_volume=market_volume, spread=spread_v,
+                                        poly_price=poly_price, poly_question=poly_question,
+                                        poly_volume=poly_volume, poly_age=poly_age,
+                                        prev_outcomes=prev_outcomes, fee_note=fee_note,
+                                        betbot_signal=bb_sig)
 
                     if not result:
                         # Fallback disabled — 160 fallback trades were net negative on every coin
                         conn.execute("""
-                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?)
                         """, (coin, wts, "PASS", 0.5, 0.0, "Engine returned no signal — fallback disabled", now_cst().isoformat()))
                         conn.commit()
                         print(f"[DECISION] {coin} wts={wts}: PASS (no engine signal)")
+                        retry_coins[coin] = wts  # retry — engine may return a signal on next attempt
                         return
 
                     direction  = result.get("direction", "")
@@ -2268,18 +3030,19 @@ def decision_loop():
                     is_betbot = bool(result.get("_betbot_size"))
                     if not is_betbot and confidence < min_conf:
                         conn.execute("""
-                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                             VALUES (?,?,?,?,?,?,?)
                         """, (coin, wts, "PASS", round(entry, 4), confidence,
                               f"Conf PASS: {confidence:.2f} <= min {min_conf:.2f}", now_cst().isoformat()))
                         conn.commit()
                         print(f"[FILTER] {coin} wts={wts}: PASS — confidence {confidence:.2f} below min {min_conf:.2f}")
+                        retry_coins[coin] = wts
                         return
 
                     # Filter 2: SOL YES above 0.55 entry — 36-43% WR at every bucket above that
                     if coin == "SOL" and direction == "YES" and entry > 0.55 and not is_betbot:
                         conn.execute("""
-                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                            INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                             VALUES (?,?,?,?,?,?,?)
                         """, (coin, wts, "PASS", round(entry, 4), confidence,
                               f"Bias PASS: SOL YES entry {entry:.3f} > 0.55 (historically 36-43% WR)", now_cst().isoformat()))
@@ -2297,18 +3060,26 @@ def decision_loop():
                         size = calc_stake(coin, confidence, capital_pre, entry=entry)
                     ok, reason = check_risk(coin, direction, entry, size)
                     if not ok:
-                        print(f"[RISK] {coin}: blocked — {reason}")
-                        conn.execute("""
-                            INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """, (coin, wts, "PASS", round(entry, 4), confidence,
-                              f"Risk block: {reason}", now_cst().isoformat()))
-
-                        conn.commit()
-                        return
+                        if reason.startswith("SIZE_CLIP:"):
+                            # Clip to max_stake and continue — don't block a high-confidence trade over pennies
+                            clipped = float(reason.split(":")[1])
+                            print(f"[RISK] {coin}: size ${size:.2f} clipped to max ${clipped:.2f} (conf={confidence:.2f})")
+                            size = clipped
+                            contracts = size / entry
+                        else:
+                            print(f"[RISK] {coin}: blocked — {reason}")
+                            conn.execute("""
+                                INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (coin, wts, "PASS", round(entry, 4), confidence,
+                                  f"Risk block: {reason}", now_cst().isoformat()))
+                            conn.commit()
+                            if "floor" in reason or "ceiling" in reason:
+                                retry_coins[coin] = wts
+                            return
 
                     conn.execute("""
-                        INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                        INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (coin, wts, direction, round(entry, 4), confidence, rationale, now_cst().isoformat()))
 
@@ -2332,7 +3103,7 @@ def decision_loop():
                                   round(requested_contracts,2), round(available,2), 0, 0,
                                   now_cst().isoformat()))
                             conn.execute("""
-                                INSERT OR IGNORE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
+                                INSERT OR REPLACE INTO decisions (coin, window_ts, direction, entry, confidence, rationale, decided_at)
                                 VALUES (?, ?, ?, ?, ?, ?, ?)
                             """, (coin, wts, "PASS", round(entry,4), confidence,
                                   f"Liquidity PASS: only {available:.0f} contracts available at {entry:.3f}",
@@ -2407,6 +3178,7 @@ def decision_loop():
                                 conn3.close()
                                 if order_id:
                                     print(f"[LIVE] {coin} order placed: {order_id}  {direction} x{live_contracts} @ {entry:.3f}")
+                                    retry_coins.pop(coin, None)  # order placed — stop retrying this coin
                                 else:
                                     print(f"[LIVE] {coin} order FAILED: {order_err}")
                     except Exception as le:
@@ -2431,19 +3203,43 @@ def decision_loop():
                     _decide_coin(coin, wts, now, pool_signals=_pool_signals, pool_lock=_pool_lock,
                                  stale_counter=_stale_counter, api_delay=api_delay)
 
-                # All coins check market data immediately; stagger only the MiniMax API call
-                threads = [threading.Thread(target=_decide_coin_pooled,
-                           args=(coin, wts, now, i * 10), daemon=True)
-                           for i, coin in enumerate(COINS)]
-                for t in threads: t.start()
-                for t in threads: t.join(timeout=180)
+                # Live coins get staggered 3s apart — they're what matters for placement.
+                # Paper-only coins fire concurrently after (timing irrelevant, no orders placed).
+                _conn_ord = db_connect()
+                _live_set = {r[0] for r in _conn_ord.execute(
+                    "SELECT coin FROM coin_modes WHERE mode='live'"
+                ).fetchall()}
+                _conn_ord.close()
+                live_coins  = [c for c in COINS if c in _live_set]
+                paper_coins = [c for c in COINS if c not in _live_set]
+                # Stagger coin API calls 4s apart to avoid hammering MiniMax rate limits
+                # Phase 1: live coins — staggered 4s apart, wait for all to finish first
+                live_threads = [
+                    threading.Thread(target=_decide_coin_pooled,
+                                     args=(coin, wts, now, i * 4), daemon=True)
+                    for i, coin in enumerate(live_coins)
+                ]
+                for t in live_threads: t.start()
+                for t in live_threads: t.join(timeout=120)
 
-                # If any coin was stale and we still have time, wait and retry
-                if len(_stale_counter) > 0 and int(time.time()) < _retry_deadline:
-                    print(f"[DECISION] {len(_stale_counter)} coins stale for wts={wts}, waiting 15s for Kalshi collector...")
+                # Phase 2: paper coins — start only after live coins are decided
+                _paper_only = [c for c in paper_coins if c not in live_coins]
+                paper_threads = [
+                    threading.Thread(target=_decide_coin_pooled,
+                                     args=(coin, wts, now, i * 4), daemon=True)
+                    for i, coin in enumerate(_paper_only)
+                ]
+                for t in paper_threads: t.start()
+                for t in paper_threads: t.join(timeout=120)
+
+                # If any LIVE coin was stale and we still have time, wait and retry
+                _live_stale = sum(1 for c in live_coins if _active_mkts.get(c, {}).get("window_ts") != wts)
+                if _live_stale > 0 and int(time.time()) < _retry_deadline:
+                    print(f"[DECISION] {_live_stale} live coin{'s' if _live_stale != 1 else ''} stale for wts={wts}, waiting 15s for Kalshi collector...")
                     time.sleep(15)
+                    _stale_counter.clear()
                     continue
-                break  # all coins got fresh data, or window closing
+                break  # live coins have fresh data (or window closing)
 
             # ── Pool mode: pick best live signal and place one order ──────────
             try:
@@ -2475,9 +3271,14 @@ def decision_loop():
                         ).fetchall()
                         if len(rows) < 3: return 0.5
                         return sum(1 for r in rows if r[0]=='WIN') / len(rows)
+                    # Only pool live coins — paper-only coins should never win the pool
+                    _pool_live_set = {r[0] for r in conn_pool2.execute(
+                        "SELECT coin FROM coin_modes WHERE mode='live'"
+                    ).fetchall()}
                     # Score = confidence * 0.7 + rolling_wr * 0.3
                     scored = sorted(
-                        [(c, _pool_signals[c]['confidence'] * 0.7 + rolling_wr(c) * 0.3) for c in _pool_signals],
+                        [(c, _pool_signals[c]['confidence'] * 0.7 + rolling_wr(c) * 0.3)
+                         for c in _pool_signals if c in _pool_live_set],
                         key=lambda x: x[1], reverse=True
                     )
                     conn_pool2.close()
@@ -2504,6 +3305,17 @@ def decision_loop():
                     skipped = [c for c, _ in scored if c not in [w for w, _ in pool_winners]]
                     for best_coin, best_score in pool_winners:
                         sig = _pool_signals[best_coin]
+                        # Staleness check before pool placement
+                        with _state_lock:
+                            _pm = _active_mkts.get(best_coin, {})
+                        _pb = float(_pm.get("yes_bid") or 0)
+                        _pa = float(_pm.get("yes_ask") or 0)
+                        _pe = (1.0 - _pb) if sig['direction'] == "NO" else _pa
+                        _drift = abs(_pe - sig['entry']) if _pe > 0 else 0
+                        if _drift > 0.10:
+                            print(f"[STALE] {best_coin} pool entry={sig['entry']:.3f} drifted to {_pe:.3f} — skipping")
+                            retry_coins[best_coin] = wts
+                            continue
                         order_id, used_ticker, order_err = place_kalshi_order(
                             best_coin, sig['ticker'], sig['direction'], sig['contracts'], sig['entry']
                         )
@@ -2520,6 +3332,7 @@ def decision_loop():
                         conn_pool3.close()
                         print(f"[POOL] {best_coin} {sig['direction']}@{sig['entry']:.3f} conf={sig['confidence']:.2f} score={best_score:.2f}  order={'OK' if order_id else 'FAIL'}")
                     _pool_last_placed_wts = wts
+                    retry_coins.clear()  # order placed — stop retrying this window
                     if skipped:
                         print(f"[POOL] skipped (below threshold {pool_multi_threshold:.2f}): {skipped}")
             except Exception as pe:
@@ -2581,7 +3394,8 @@ def get_engine_for_coin(coin):
         return "minimax_llm"
 
 def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_volume=None, spread=None,
-               poly_price=None, prev_outcomes=None, fee_note=None):
+               poly_price=None, poly_question=None, poly_volume=None, poly_age=None,
+               prev_outcomes=None, fee_note=None, betbot_signal=None):
     if engine_key == "rules_engine":
         return rules_engine(coin, mkt)
     elif engine_key == "vector_knn":
@@ -2603,8 +3417,10 @@ def run_engine(engine_key, coin, mkt, ticks, coin_price, ticks_summary, market_v
                                market_volume=market_volume, spread=spread,
                                rules_signal=rules_sig, knn_signal=knn_sig,
                                price_momentum=price_momentum,
-                               poly_price=poly_price, prev_outcomes=prev_outcomes,
-                               fee_note=fee_note)
+                               poly_price=poly_price, poly_question=poly_question,
+                               poly_volume=poly_volume, poly_age=poly_age,
+                               prev_outcomes=prev_outcomes, fee_note=fee_note,
+                               betbot_signal=betbot_signal)
 
 def rules_engine(coin, mkt):
     try:
@@ -2720,6 +3536,410 @@ def hybrid_engine(coin, mkt, ticks):
         rules["rationale"] += " + KNN"
     return rules
 
+
+
+# ── Recovery Watcher ─────────────────────────────────────────────────────────
+
+def backtest_recovery_watcher(threshold_cents=5, min_secs_left=60, start_ts=None, end_ts=None):
+    """
+    Replay all historical losing paper_trades and simulate recovery buys.
+    Returns stats dict with per-trade detail list.
+    """
+    import math as _math
+    conn = db_connect()
+    where = "pt.result='LOSS'"
+    params = []
+    if start_ts:
+        where += " AND pt.window_ts >= ?"; params.append(int(start_ts))
+    if end_ts:
+        where += " AND pt.window_ts <= ?"; params.append(int(end_ts))
+
+    losses = conn.execute(f"""
+        SELECT pt.id, pt.coin, pt.window_ts, pt.direction, pt.entry, pt.contracts, pt.pnl,
+               CAST(strftime('%s', pt.decided_at) AS INTEGER) as decided_ts
+        FROM paper_trades pt WHERE {where}
+        ORDER BY pt.window_ts DESC
+    """, params).fetchall()
+
+    threshold = threshold_cents / 100.0
+    stats = {
+        'total_losses': len(losses), 'total_loss_dollars': 0.0,
+        'windows_with_opportunity': 0, 'recoveries_won': 0, 'recoveries_lost': 0,
+        'recovery_net_pnl': 0.0, 'avg_opportunity_secs_left': 0.0,
+        'details': []
+    }
+    opp_secs = []
+
+    for row in losses:
+        tid, coin, wts, direction, entry, contracts, pnl, decided_ts = row
+        stats['total_loss_dollars'] += abs(float(pnl or 0))
+        decided_ts = int(decided_ts or 0)
+
+        ticks = conn.execute("""
+            SELECT yes_bid, yes_ask, secs_left, ts
+            FROM kalshi_ticks WHERE coin=? AND window_ts=? AND ts >= ?
+            ORDER BY ts ASC
+        """, (coin, wts, decided_ts)).fetchall()
+        if not ticks:
+            continue
+
+        opp_tick = None
+        for tick in ticks:
+            yb, ya, sl, ts_ = tick
+            if sl is None or sl < min_secs_left:
+                continue
+            if direction == 'NO' and ya and 0 < ya <= threshold:
+                opp_tick = tick; break
+            elif direction == 'YES' and yb is not None and (1.0 - yb) <= threshold and yb > 0:
+                opp_tick = tick; break
+        if not opp_tick:
+            continue
+
+        stats['windows_with_opportunity'] += 1
+        yb, ya, sl, _ = opp_tick
+        opp_secs.append(sl)
+
+        if direction == 'NO':
+            rec_price  = ya
+            rec_dir    = 'YES'
+        else:
+            rec_price  = round(1.0 - yb, 4)
+            rec_dir    = 'NO'
+
+        loss_amt = abs(float(pnl or 0))
+        net_per  = 1.0 - rec_price
+        rec_n    = _math.ceil(loss_amt / net_per) if net_per > 0.01 else 20
+        rec_cost = round(rec_n * rec_price, 4)
+
+        final = ticks[-1]
+        f_yb, f_ya = final[0], final[1]
+        if rec_dir == 'YES':
+            won = bool(f_yb is not None and f_yb >= 0.85)
+        else:
+            won = bool(f_ya is not None and f_ya <= 0.15)
+
+        fee = rec_n * min(KALSHI_FEE_RATE * rec_price * (1.0 - rec_price), 0.02)
+        if won:
+            rec_pnl = round(rec_n * (1.0 - rec_price) - fee, 4)
+            stats['recoveries_won'] += 1
+        else:
+            rec_pnl = round(-rec_cost, 4)
+            stats['recoveries_lost'] += 1
+
+        stats['recovery_net_pnl'] += rec_pnl
+        stats['details'].append({
+            'coin': coin, 'wts': wts, 'direction': direction, 'entry': entry,
+            'original_pnl': float(pnl or 0), 'opp_price': rec_price,
+            'opp_secs_left': sl, 'rec_direction': rec_dir, 'rec_contracts': rec_n,
+            'rec_cost': rec_cost, 'rec_pnl': rec_pnl, 'won': won
+        })
+
+    if opp_secs:
+        stats['avg_opportunity_secs_left'] = round(sum(opp_secs) / len(opp_secs), 1)
+    stats['recovery_net_pnl']      = round(stats['recovery_net_pnl'], 4)
+    stats['pnl_without_recovery']  = round(-stats['total_loss_dollars'], 4)
+    stats['pnl_with_recovery']     = round(-stats['total_loss_dollars'] + stats['recovery_net_pnl'], 4)
+    conn.close()
+    return stats
+
+
+def _do_recovery_check():
+    """Core recovery logic — called every 3 s by recovery_watcher_loop."""
+    import math as _math
+    conn = db_connect()
+    enabled = (conn.execute("SELECT value FROM settings WHERE key='recovery_enabled'").fetchone() or ['0'])[0] == '1'
+    if not enabled:
+        conn.close(); return
+    threshold_cents = float((conn.execute("SELECT value FROM settings WHERE key='recovery_threshold_cents'").fetchone() or [5])[0])
+    max_n           = int((conn.execute("SELECT value FROM settings WHERE key='recovery_max_contracts'").fetchone() or [20])[0])
+    live_ok         = (conn.execute("SELECT value FROM settings WHERE key='recovery_live_enabled'").fetchone() or ['0'])[0] == '1'
+    threshold       = threshold_cents / 100.0
+
+    now = int(time.time())
+    positions = conn.execute("""
+        SELECT id, coin, ticker, direction, filled_contracts, avg_fill_price, window_ts
+        FROM live_orders
+        WHERE status IN ('filled','executed','filled_partial')
+          AND filled_contracts > 0 AND exit_at IS NULL AND window_ts >= ?
+    """, (now - 1800,)).fetchall()
+    conn.close()
+
+    with _state_lock:
+        mkts = {k: dict(v) for k, v in _active_mkts.items()}
+
+    for pos in positions:
+        lo_id, coin, ticker, direction, n, avg_price, wts = pos
+        n = int(n or 0); avg_price = float(avg_price or 0)
+        if not n or not avg_price:
+            continue
+
+        mkt      = mkts.get(coin, {})
+        yes_ask  = float(mkt.get('yes_ask') or 0)
+        yes_bid  = float(mkt.get('yes_bid') or 0)
+        secs_left = float(mkt.get('secs_left') or 0)
+        if not yes_ask or not yes_bid or secs_left < 30:
+            continue
+
+        # Skip if a recovery trade already exists for this position
+        conn2 = db_connect()
+        existing = conn2.execute("SELECT id FROM recovery_trades WHERE lo_id=? AND result != 'PENDING'", (lo_id,)).fetchone()
+        pending  = conn2.execute("SELECT id FROM recovery_trades WHERE lo_id=? AND result = 'PENDING'", (lo_id,)).fetchone()
+        conn2.close()
+        if existing or pending:
+            continue
+
+        with _recovery_lock:
+            state = dict(_recovery_state.get(lo_id, {'armed': False, 'armed_price': None, 'prev_ask': None}))
+
+        if direction == 'NO':
+            opp_ask    = yes_ask
+            rec_dir    = 'YES'
+        else:
+            opp_ask    = round(1.0 - yes_bid, 4)
+            rec_dir    = 'NO'
+
+        # ARM ─ opposite is at or below threshold
+        if not state.get('armed') and 0 < opp_ask <= threshold:
+            with _recovery_lock:
+                _recovery_state[lo_id] = {
+                    'armed': True, 'armed_price': opp_ask, 'prev_ask': opp_ask,
+                    'coin': coin, 'ticker': ticker, 'direction': direction,
+                    'rec_dir': rec_dir, 'wts': wts, 'n': n, 'avg_price': avg_price
+                }
+            log_event(f"[RECOVERY] {coin} {direction}: ARMED — {rec_dir} ask={opp_ask:.3f} ({secs_left:.0f}s left)")
+            continue
+
+        # FIRE ─ armed + first uptick (reversal confirmation)
+        if state.get('armed'):
+            armed_price = state['armed_price']
+            prev_ask    = state.get('prev_ask', opp_ask)
+            fire = (opp_ask > armed_price + 0.01) or (opp_ask > prev_ask and opp_ask > threshold)
+            if fire:
+                loss_est = n * avg_price
+                net_per  = 1.0 - opp_ask
+                rec_n    = min(max_n, _math.ceil(loss_est / net_per) if net_per > 0.01 else max_n)
+                rec_cost = round(rec_n * opp_ask, 4)
+                mode     = "LIVE" if live_ok else "PAPER"
+                err      = None
+                if live_ok:
+                    _, _, err = place_kalshi_order(coin, ticker, rec_dir, rec_n, opp_ask)
+                if not err:
+                    conn3 = db_connect()
+                    conn3.execute("""
+                        INSERT INTO recovery_trades
+                        (lo_id, coin, window_ts, ticker, direction, threshold_ask, trigger_ask,
+                         contracts, cost, result, is_paper, created_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,'PENDING',?,?)
+                    """, (lo_id, coin, wts, ticker, rec_dir, armed_price, opp_ask,
+                          rec_n, rec_cost, 0 if live_ok else 1, now_cst().isoformat()))
+                    conn3.commit(); conn3.close()
+                    log_event(f"[RECOVERY {mode}] {coin} {rec_dir} {rec_n}c @ {opp_ask:.3f} "
+                              f"cost=${rec_cost:.2f} armed@{armed_price:.3f} {secs_left:.0f}s")
+                    audit("recovery_placed", "recovery_trades", str(lo_id), {
+                        "coin": coin, "direction": rec_dir, "contracts": rec_n,
+                        "trigger_ask": opp_ask, "armed": armed_price,
+                        "paper": not live_ok, "secs": secs_left})
+                    with _recovery_lock:
+                        _recovery_state.pop(lo_id, None)
+                else:
+                    log_event(f"[RECOVERY] {coin}: order error — {err}")
+            else:
+                with _recovery_lock:
+                    if lo_id in _recovery_state:
+                        _recovery_state[lo_id]['prev_ask'] = opp_ask
+
+
+def recovery_watcher_loop():
+    time.sleep(25)
+    while True:
+        try:
+            _do_recovery_check()
+        except Exception as exc:
+            print(f"[RECOVERY] {exc}")
+        time.sleep(3)
+
+
+def resolve_recovery_trades():
+    """Mark PENDING recovery trades WIN/LOSS after their window settles."""
+    now = int(time.time())
+    conn = db_connect()
+    pending = conn.execute("""
+        SELECT id, coin, window_ts, ticker, direction, contracts, cost, is_paper
+        FROM recovery_trades WHERE result='PENDING' AND ? > window_ts + 1020
+    """, (now,)).fetchall()
+    for row in pending:
+        rid, coin, wts, ticker, direction, contracts, cost, is_paper = row
+        contracts = int(contracts or 0); cost = float(cost or 0)
+        if is_paper:
+            p_open  = get_price_at(conn, coin, wts, tol=120)
+            p_close = get_price_at(conn, coin, wts + 900, tol=600)
+            if not p_open or not p_close:
+                continue
+            actual = "YES" if p_close > p_open else "NO"
+        else:
+            mkt_data = kalshi_get(f"/markets/{ticker}")
+            if not mkt_data:
+                continue
+            r = (mkt_data.get("market", mkt_data).get("result") or "").lower()
+            if r not in ("yes", "no"):
+                continue
+            actual = "YES" if r == "yes" else "NO"
+        won  = (direction == actual)
+        ep   = cost / contracts if contracts > 0 else 0
+        fee  = contracts * min(KALSHI_FEE_RATE * ep * (1.0 - ep), 0.02)
+        pnl  = round(contracts * (1.0 - ep) - fee, 4) if won else round(-cost, 4)
+        result = "WIN" if won else "LOSS"
+        conn.execute("""UPDATE recovery_trades SET pnl=?, result=?, resolved_at=? WHERE id=?""",
+                     (pnl, result, now_cst().isoformat(), rid))
+        log_event(f"[RECOVERY SETTLED] {coin} {direction} {contracts}c: {result} pnl={pnl:+.2f}")
+    conn.commit(); conn.close()
+
+
+def build_recovery_page(user=None, msg="", backtest_result=None):
+    conn = db_connect()
+    trades = conn.execute("""
+        SELECT rt.id, rt.coin, rt.window_ts, rt.direction, rt.threshold_ask, rt.trigger_ask,
+               rt.contracts, rt.cost, rt.pnl, rt.result, rt.is_paper, rt.created_at,
+               lo.direction as orig_dir, lo.avg_fill_price as orig_entry, lo.pnl as orig_pnl
+        FROM recovery_trades rt
+        LEFT JOIN live_orders lo ON rt.lo_id = lo.id
+        ORDER BY rt.created_at DESC LIMIT 60
+    """).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM recovery_trades WHERE result != 'PENDING'").fetchone()[0] or 0
+    wins  = conn.execute("SELECT COUNT(*) FROM recovery_trades WHERE result='WIN'").fetchone()[0] or 0
+    net   = conn.execute("SELECT COALESCE(SUM(pnl),0) FROM recovery_trades WHERE result != 'PENDING'").fetchone()[0] or 0
+    settings = {}
+    for k in ['recovery_enabled','recovery_threshold_cents','recovery_max_contracts','recovery_live_enabled']:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+        settings[k] = row[0] if row else ''
+    conn.close()
+
+    en_chk   = 'checked' if settings.get('recovery_enabled') == '1' else ''
+    live_chk = 'checked' if settings.get('recovery_live_enabled') == '1' else ''
+    wr_str   = f"{wins/total*100:.0f}%" if total > 0 else "—"
+    net_col  = '#3fb950' if float(net) >= 0 else '#f85149'
+
+    bt_html = ""
+    if backtest_result:
+        bt = backtest_result
+        opp_pct = f"{bt['windows_with_opportunity']/bt['total_losses']*100:.0f}%" if bt['total_losses'] else "—"
+        wr_bt   = f"{bt['recoveries_won']/(bt['windows_with_opportunity'] or 1)*100:.0f}%"
+        imp_col = '#3fb950' if bt['pnl_with_recovery'] > bt['pnl_without_recovery'] else '#f85149'
+        rows_html = ""
+        for d in bt['details'][:100]:
+            wc = '#3fb950' if d['won'] else '#f85149'
+            rows_html += (f"<tr><td>{d['coin']}</td><td>{d['direction']}</td>"
+                          f"<td style='color:#f85149'>${d['original_pnl']:.2f}</td>"
+                          f"<td>{d['opp_price']:.3f}</td><td>{d['opp_secs_left']:.0f}s</td>"
+                          f"<td>{d['rec_direction']}</td><td>{d['rec_contracts']}</td>"
+                          f"<td>${d['rec_cost']:.2f}</td>"
+                          f"<td style='color:{wc}'>${d['rec_pnl']:+.2f}</td>"
+                          f"<td style='color:{wc}'>{"WIN" if d['won'] else "LOSS"}</td></tr>")
+        bt_html = f"""
+        <div class="card" style="margin-bottom:16px;background:#0d2b1a;border:1px solid #2ea44340">
+          <h3 style="color:#3fb950;margin:0 0 12px">Backtest Results — {bt['total_losses']} losses analyzed</h3>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px">
+            <div class="card"><div style="font-size:22px;font-weight:700">{bt['windows_with_opportunity']}</div><div style="color:#8b949e;font-size:11px">Had Opportunity ({opp_pct})</div></div>
+            <div class="card"><div style="font-size:22px;font-weight:700;color:#3fb950">{bt['recoveries_won']}</div><div style="color:#8b949e;font-size:11px">Would Win ({wr_bt})</div></div>
+            <div class="card"><div style="font-size:22px;font-weight:700;color:#f85149">{bt['recoveries_lost']}</div><div style="color:#8b949e;font-size:11px">Would Lose More</div></div>
+            <div class="card"><div style="font-size:22px;font-weight:700;color:{'#3fb950' if bt['recovery_net_pnl']>=0 else '#f85149'}">${bt['recovery_net_pnl']:+.2f}</div><div style="color:#8b949e;font-size:11px">Recovery Net P&L</div></div>
+            <div class="card"><div style="font-size:22px;font-weight:700;color:#f85149">${bt['pnl_without_recovery']:.2f}</div><div style="color:#8b949e;font-size:11px">Without Recovery</div></div>
+            <div class="card"><div style="font-size:22px;font-weight:700;color:{imp_col}">${bt['pnl_with_recovery']:.2f}</div><div style="color:#8b949e;font-size:11px">With Recovery</div></div>
+            <div class="card"><div style="font-size:22px;font-weight:700">{bt['avg_opportunity_secs_left']:.0f}s</div><div style="color:#8b949e;font-size:11px">Avg Secs at Opportunity</div></div>
+          </div>
+          <details><summary style="cursor:pointer;color:#8b949e;font-size:12px">Per-trade detail ({len(bt['details'])} trades)</summary>
+          <div class="table-scroll" style="margin-top:8px">
+          <table class="data-table"><thead><tr>
+            <th>Coin</th><th>Dir</th><th>Orig PnL</th><th>Opp@</th><th>Secs</th>
+            <th>Rec Dir</th><th>Rec N</th><th>Cost</th><th>Rec PnL</th><th>Result</th>
+          </tr></thead><tbody>{rows_html}</tbody></table></div></details>
+        </div>"""
+
+    trades_html = ""
+    for t in trades:
+        rid, coin, wts, direction, thr, trg, contracts, cost, pnl, result, is_paper, created_at, orig_dir, orig_entry, orig_pnl = t
+        rc = '#3fb950' if result == 'WIN' else ('#f85149' if result == 'LOSS' else '#e3b341')
+        mode = '<span style="background:#162032;padding:1px 6px;border-radius:4px;font-size:10px">paper</span>' if is_paper else '<span style="background:#2d1b00;padding:1px 6px;border-radius:4px;font-size:10px">live</span>'
+        pnl_s = f"${pnl:+.2f}" if pnl is not None else "—"
+        orig_s = f"{orig_dir}@{orig_entry:.2f} (${orig_pnl:.2f})" if orig_dir else "—"
+        ts_s = (created_at or '')[:16]
+        trades_html += (f"<tr><td>{coin}</td><td>{direction}</td>"
+                        f"<td>{thr:.3f}</td><td>{trg:.3f}</td>"
+                        f"<td>{contracts}</td><td>${cost:.2f}</td>"
+                        f"<td style='color:{rc}'>{pnl_s}</td>"
+                        f"<td style='color:{rc}'>{result}</td>"
+                        f"<td>{mode}</td><td style='color:#8b949e'>{orig_s}</td>"
+                        f"<td style='color:#8b949e;font-size:10px'>{ts_s}</td></tr>")
+
+    msg_html = f'<div class="alert alert-ok">{msg}</div>' if msg else ""
+    body = f"""
+{msg_html}
+<h2 style="margin:0 0 8px">Recovery Watcher</h2>
+<p style="color:#8b949e;font-size:13px;margin-bottom:18px">
+  Monitors open losing positions and buys the opposite direction when it drops to ≤threshold cents,
+  then fires on the first uptick (reversal confirmation) to capture the swing and offset the original loss.
+</p>
+
+<div class="card" style="margin-bottom:14px">
+  <h3 style="margin:0 0 10px">Settings</h3>
+  <form method="POST" action="/recovery/settings">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" name="recovery_enabled" {en_chk}> Enable Recovery Watcher (paper)
+      </label>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" name="recovery_live_enabled" {live_chk}>
+        <span>Place <b>LIVE</b> recovery orders <span style="color:#d29922;font-size:11px">(real money)</span></span>
+      </label>
+      <div>
+        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:4px">Arm threshold (cents)</label>
+        <input type="number" name="recovery_threshold_cents" value="{settings.get('recovery_threshold_cents','5')}" min="1" max="15" style="width:70px">
+        <span style="font-size:11px;color:#8b949e"> arm when opposite drops to ≤ this</span>
+      </div>
+      <div>
+        <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:4px">Max recovery contracts</label>
+        <input type="number" name="recovery_max_contracts" value="{settings.get('recovery_max_contracts','20')}" min="1" max="500" style="width:70px">
+      </div>
+    </div>
+    <button type="submit" class="btn" style="margin-top:12px;background:#238636;border-color:#2ea043">Save Settings</button>
+  </form>
+</div>
+
+<div class="card" style="margin-bottom:14px">
+  <h3 style="margin:0 0 10px">Backtest on Historical Paper Losses</h3>
+  <form method="POST" action="/recovery/backtest" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div>
+      <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:4px">Threshold (cents)</label>
+      <input type="number" name="threshold_cents" value="5" min="1" max="15" style="width:70px">
+    </div>
+    <div>
+      <label style="display:block;font-size:11px;color:#8b949e;margin-bottom:4px">Min secs remaining</label>
+      <input type="number" name="min_secs_left" value="60" min="0" max="800" style="width:80px">
+    </div>
+    <button type="submit" class="btn" style="background:#1f6feb;border-color:#388bfd">Run Backtest</button>
+  </form>
+</div>
+
+{bt_html}
+
+<div class="card">
+  <h3 style="margin:0 0 8px">Recovery Trade History</h3>
+  <div style="display:flex;gap:20px;margin-bottom:10px;font-size:13px">
+    <span>Total: <b>{total}</b></span>
+    <span>Win rate: <b>{wr_str}</b></span>
+    <span>Net P&L: <b style="color:{net_col}">${float(net):+.2f}</b></span>
+  </div>
+  <div class="table-scroll">
+    <table class="data-table"><thead><tr>
+      <th>Coin</th><th>Dir</th><th>Armed@</th><th>Fired@</th><th>N</th><th>Cost</th>
+      <th>PnL</th><th>Result</th><th>Mode</th><th>Original</th><th>Time</th>
+    </tr></thead>
+    <tbody>{trades_html or '<tr><td colspan="11" style="text-align:center;color:#8b949e;padding:20px">No recovery trades yet — enable the watcher or run a backtest</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+"""
+    return page_shell("Recovery", "/recovery", body, user=user)
 
 # ── Replay engine ────────────────────────────────────────────────────────────────
 def run_replay(coin, engine_key, start_ts, end_ts, starting_capital=100.0, run_name=None):
@@ -3065,12 +4285,23 @@ SHARED_CSS = """
   #chat-btn:hover { transform: scale(1.1); }
   #chat-panel { display: none; position: fixed; bottom: 80px; right: 8px; left: 8px; max-height: 70vh; background: #161b22; border: 1px solid #30363d; border-radius: 12px; z-index: 1000; flex-direction: column; box-shadow: 0 8px 32px rgba(0,0,0,0.6); }
   #chat-panel.open { display: flex; }
-  #chat-header { padding: 12px 16px; border-bottom: 1px solid #30363d; font-weight: 700; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+  #chat-header { padding: 10px 16px; border-bottom: 1px solid #30363d; font-weight: 700; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+  .chat-tabs { display: flex; gap: 4px; }
+  .chat-tab { background: none; border: 1px solid #30363d; border-radius: 6px; color: #8b949e; font-size: 11px; padding: 2px 10px; cursor: pointer; }
+  .chat-tab.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
   #chat-msgs { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
   .chat-msg { padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; max-width: 90%; }
   .chat-msg.user { background: #1f3a5f; align-self: flex-end; }
   .chat-msg.assistant { background: #21262d; align-self: flex-start; }
   #chat-input-row { padding: 10px; border-top: 1px solid #30363d; display: flex; gap: 8px; }
+  #live-feed { flex: 1; overflow-y: auto; padding: 10px 12px; display: none; flex-direction: column; font-family: monospace; font-size: 11px; gap: 2px; }
+  #live-feed.active { display: flex; }
+  .live-line { color: #8b949e; white-space: pre-wrap; word-break: break-all; padding: 1px 0; border-bottom: 1px solid #21262d; }
+  .live-line.hl-decision { color: #58a6ff; }
+  .live-line.hl-trade { color: #3fb950; }
+  .live-line.hl-exit { color: #f0883e; }
+  .live-line.hl-error { color: #f85149; }
+  #live-status { font-size: 10px; padding: 3px 12px; color: #8b949e; border-top: 1px solid #30363d; }
   #chat-input { flex: 1; resize: none; height: 40px; font-family: inherit; font-size: 16px; }
   #chat-send { padding: 8px 14px; }
   @media (min-width: 768px) {
@@ -3126,6 +4357,7 @@ def page_shell(title, active_nav, body, extra_js="", user=None):
         ("/audit",      "Audit"),
         ("/settings",   "Settings"),
         ("/health",     "Health"),
+        ("/recovery",   "Recovery"),
     ]
     nav_html = "".join(
         f'<a href="{href}" class="{"active" if href == active_nav else ""}">{label}</a>'
@@ -3171,6 +4403,17 @@ function showDetail(text) {{
   document.getElementById('detail-modal-body').textContent = text;
   document.getElementById('detail-modal').style.display = 'flex';
 }}
+function cancelOrder(orderId, coin) {{
+  if (!confirm('Cancel ' + coin + ' order ' + orderId.slice(0,8) + '…?')) return;
+  fetch('/api/cancel_order', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{order_id: orderId}})
+  }}).then(r => r.json()).then(d => {{
+    if (d.ok) {{ alert('Order cancelled.'); location.reload(); }}
+    else alert('Cancel failed: ' + (d.error || 'unknown error'));
+  }}).catch(e => alert('Cancel error: ' + e));
+}}
 document.addEventListener('keydown', function(e){{ if(e.key==='Escape') document.getElementById('detail-modal').style.display='none'; }});
 document.getElementById('detail-modal').addEventListener('click', function(e){{ if(e.target===this) this.style.display='none'; }});
 </script>
@@ -3179,13 +4422,19 @@ document.getElementById('detail-modal').addEventListener('click', function(e){{ 
 <button id="chat-btn" onclick="toggleChat()" title="Ask Autobet">💬</button>
 <div id="chat-panel">
   <div id="chat-header">
-    <span>Autobet Chat</span>
+    <div class="chat-tabs">
+      <button class="chat-tab active" id="tab-chat" onclick="switchTab('chat')">Chat</button>
+      <button class="chat-tab" id="tab-live" onclick="switchTab('live')">⬤ Live</button>
+    </div>
     <div style="display:flex;gap:6px">
-      <button class="btn" onclick="clearChat()" style="padding:2px 8px;font-size:11px;color:#8b949e" title="Clear history">clear</button>
+      <button class="btn" onclick="clearChat()" style="padding:2px 8px;font-size:11px;color:#8b949e" title="Clear chat history">clear</button>
+      <button class="btn" onclick="popoutChat()" style="padding:2px 8px;font-size:11px;color:#8b949e" title="Pop out chat">⤢</button>
       <button class="btn" onclick="toggleChat()" style="padding:2px 8px">✕</button>
     </div>
   </div>
   <div id="chat-msgs"></div>
+  <div id="live-feed"></div>
+  <div id="live-status" style="display:none">connecting…</div>
   <div id="chat-input-row">
     <textarea id="chat-input" class="form-input" placeholder="Ask about trades, decisions, settings…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendChat();}}"></textarea>
     <button class="btn btn-primary" id="chat-send" onclick="sendChat()">Send</button>
@@ -3205,6 +4454,9 @@ function toggleChat() {{
   if (p.classList.contains('open')) {{
     var msgs = document.getElementById('chat-msgs');
     msgs.scrollTop = msgs.scrollHeight;
+    if (_liveTab === 'live') startLiveFeed();
+  }} else {{
+    stopLiveFeed();
   }}
 }}
 // Restore chat history on page load
@@ -3267,6 +4519,79 @@ function appendChat(role, text, save) {{
 function clearChat() {{
   localStorage.removeItem(CHAT_KEY);
   document.getElementById('chat-msgs').innerHTML = '';
+}}
+function popoutChat() {{
+  window.open('/chat', 'autobet_chat', 'width=380,height=520,resizable=yes');
+  toggleChat();
+}}
+
+// ── Live feed ──────────────────────────────────────────────────────────────
+var _liveTab = 'chat';
+var _liveES = null;
+var _livePaused = false;
+
+function switchTab(tab) {{
+  _liveTab = tab;
+  document.getElementById('tab-chat').classList.toggle('active', tab === 'chat');
+  document.getElementById('tab-live').classList.toggle('active', tab === 'live');
+  document.getElementById('chat-msgs').style.display = tab === 'chat' ? '' : 'none';
+  document.getElementById('chat-input-row').style.display = tab === 'chat' ? '' : 'none';
+  var lf = document.getElementById('live-feed');
+  var ls = document.getElementById('live-status');
+  if (tab === 'live') {{
+    lf.classList.add('active');
+    ls.style.display = '';
+    startLiveFeed();
+    lf.scrollTop = lf.scrollHeight;
+  }} else {{
+    lf.classList.remove('active');
+    ls.style.display = 'none';
+  }}
+}}
+
+function liveLineClass(text) {{
+  if (/\\[DECISION\\]|\\[DUAL LLM\\]|\\[ENGINE\\]|\\[DECIDE\\]/i.test(text)) return 'live-line hl-decision';
+  if (/placed|WIN|filled|order_id/i.test(text)) return 'live-line hl-trade';
+  if (/\\[EXIT\\]|hard_take_profit|trailing_stop|stop_loss|time_cliff/i.test(text)) return 'live-line hl-exit';
+  if (/error|exception|traceback|failed/i.test(text)) return 'live-line hl-error';
+  return 'live-line';
+}}
+
+function appendLiveLine(text) {{
+  var lf = document.getElementById('live-feed');
+  var div = document.createElement('div');
+  div.className = liveLineClass(text);
+  div.textContent = text;
+  lf.appendChild(div);
+  // Cap at 500 lines
+  while (lf.children.length > 500) lf.removeChild(lf.firstChild);
+  if (!_livePaused) lf.scrollTop = lf.scrollHeight;
+}}
+
+function startLiveFeed() {{
+  if (_liveES) return; // already connected
+  var ls = document.getElementById('live-status');
+  ls.textContent = 'connecting…';
+  _liveES = new EventSource('/api/log-stream');
+  _liveES.onopen = function() {{ ls.textContent = '● live'; ls.style.color = '#3fb950'; }};
+  _liveES.onmessage = function(e) {{
+    if (e.data) appendLiveLine(e.data);
+  }};
+  _liveES.onerror = function() {{
+    ls.textContent = '○ disconnected — retrying';
+    ls.style.color = '#f85149';
+    _liveES.close(); _liveES = null;
+    setTimeout(function() {{ if (_liveTab === 'live') startLiveFeed(); }}, 3000);
+  }};
+  // Pause auto-scroll when user scrolls up
+  document.getElementById('live-feed').addEventListener('scroll', function() {{
+    var lf = this;
+    _livePaused = lf.scrollTop < lf.scrollHeight - lf.clientHeight - 40;
+  }});
+}}
+
+function stopLiveFeed() {{
+  if (_liveES) {{ _liveES.close(); _liveES = null; }}
 }}
 </script>
 </body>
@@ -3493,7 +4818,7 @@ def build_dashboard(user=None):
     coin_live_history = {}
     for coin in COINS:
         rows = conn.execute("""
-            SELECT direction, contracts, avg_fill_price, status, pnl, window_ts, actual_direction
+            SELECT direction, contracts, avg_fill_price, status, pnl, window_ts, actual_direction, exit_reason
             FROM live_orders WHERE coin=? AND order_id IS NOT NULL
             ORDER BY id DESC LIMIT 5
         """, (coin,)).fetchall()
@@ -3502,10 +4827,12 @@ def build_dashboard(user=None):
     pool_last = conn.execute(
         "SELECT coin, direction, contracts, status, window_ts FROM live_orders ORDER BY id DESC LIMIT 1"
     ).fetchone()
+    _live_coin_set = {r[0] for r in conn.execute("SELECT coin FROM coin_modes WHERE mode='live'").fetchall()}
     pool_recent_orders = conn.execute(
         "SELECT coin, direction, contracts, status, window_ts, limit_price FROM live_orders WHERE window_ts >= ? ORDER BY id DESC LIMIT 10",
         (int(time.time()) - 7200,)
     ).fetchall()
+    pool_recent_orders = [o for o in pool_recent_orders if o[0] in _live_coin_set]
     conn.close()
 
     with _state_lock:
@@ -3522,15 +4849,21 @@ def build_dashboard(user=None):
     body = f"""
 <div class="window-bar">
   <span>Window: <strong>{wts_cst_str}</strong></span>
-  <span>Remaining: <strong style="color:{'#3fb950' if secs_left>300 else '#d29922' if secs_left>60 else '#f85149'}">{secs_left}s</strong></span>
+  <span>Remaining: <strong style="color:{'#3fb950' if secs_left>300 else '#d29922' if secs_left>60 else '#f85149'}">{f"{secs_left//60}m {secs_left%60:02d}s" if secs_left>=60 else f"{secs_left}s"}</strong></span>
   <span>Mode: {mode_badge}</span>
   <span>Model: <strong>{get_minimax_model()}</strong></span>
 </div>
 <div class="section-title">Market Snapshot</div>
-<div class="row">
 """
-    for coin in COINS:
+    # coin_modes_db already fetched above — use it to order cards live-first
+    live_coins_dash  = [c for c in COINS if live_on and coin_modes_db.get(c) == 'live']
+    paper_coins_dash = [c for c in COINS if c not in live_coins_dash]
+    ordered_coins_dash = live_coins_dash + paper_coins_dash
+    body += '<div class="row">\n'
+    for coin in ordered_coins_dash:
         color  = COIN_COLORS[coin]
+        if paper_coins_dash and coin == paper_coins_dash[0]:
+            body += '</div>\n<div class="row">\n'
         letter = COIN_LETTERS[coin]
         price  = prices.get(coin)
         price_str = (f"${price:,.4f}" if price and price < 10 else f"${price:,.2f}") if price else "---"
@@ -3558,7 +4891,9 @@ def build_dashboard(user=None):
         poly_str   = f'{poly_price:.3f}' if poly_price else "—"
         if open_t:
             d2, e2, sz2 = open_t[0], open_t[1], open_t[2]
-            open_badge = f'<a href="/coin/{coin}" style="text-decoration:none"><span class="badge badge-open" title="Active paper bet — click for details">{d2} @ {e2:.3f} &nbsp;${sz2:.0f} stake</span></a>'
+            t2 = open_t[3]
+            t2_str = ts_cst(int(datetime.fromisoformat(t2).timestamp())).strftime("%-I:%M%p").lower() if t2 else ""
+            open_badge = f'<a href="/coin/{coin}" style="text-decoration:none"><span class="badge badge-open" title="Active paper bet — click for details">{d2} @ {e2:.3f} &nbsp;${sz2:.0f} stake{(" · "+t2_str) if t2_str else ""}</span></a>'
         else:
             open_badge = '<span class="muted" style="font-size:12px">no open bet</span>'
         ev_data = coin_ev.get(coin)
@@ -3612,13 +4947,36 @@ def build_dashboard(user=None):
     <span style="font-size:9px;color:#555">{secs_left}s left</span>
   </div>
 </div>'''
+            # Pending order (placed but not yet filled this window)
+            if last_order and not active_html:
+                lo_dir, lo_contracts, lo_status, lo_error, lo_time, lo_wts, lo_avg_price, lo_filled = last_order
+                if lo_wts == wts and lo_status == "placed":
+                    lo_order_id = conn_peek.execute(
+                        "SELECT order_id FROM live_orders WHERE coin=? AND window_ts=? AND status='placed' ORDER BY id DESC LIMIT 1",
+                        (coin, wts)
+                    ).fetchone() if False else None
+                    # fetch order_id inline
+                    conn_peek2 = db_connect()
+                    lo_oid_row = conn_peek2.execute(
+                        "SELECT order_id, limit_price FROM live_orders WHERE coin=? AND window_ts=? AND status='placed' ORDER BY id DESC LIMIT 1",
+                        (coin, wts)
+                    ).fetchone()
+                    conn_peek2.close()
+                    if lo_oid_row:
+                        lo_oid, lo_lp = lo_oid_row
+                        active_html = f'''<div style="margin-bottom:4px;padding:4px 0;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:6px">
+  <span style="font-size:9px;background:#e3b341;color:#000;padding:1px 5px;border-radius:3px;font-weight:700">PENDING</span>
+  <span style="font-size:11px;color:#e6edf3;font-weight:700">{lo_dir}</span>
+  <span style="font-size:10px;color:#8b949e">{lo_contracts}c @ {lo_lp}¢</span>
+  <button onclick="event.stopPropagation();cancelOrder('{lo_oid}','{coin}')" style="margin-left:auto;background:#da3633;color:#fff;border:none;border-radius:4px;padding:2px 8px;font-size:10px;cursor:pointer">Cancel</button>
+</div>'''
             # Activity log rows
             rows_html = ""
-            for h_dir, h_contracts, h_avg_price, h_status, h_pnl, h_wts, h_actual_dir in hist:
+            for h_dir, h_contracts, h_avg_price, h_status, h_pnl, h_wts, h_actual_dir, h_exit_reason in hist:
                 h_time_s = ts_cst(h_wts).strftime("%H:%M") if h_wts else "—"
                 if h_status == "canceled":
                     row_color = "#8b949e"
-                    result_s  = "canceled"
+                    result_s, row_color = order_status_label(h_status, h_contracts)
                     pnl_s     = ""
                 elif h_pnl is not None and h_status in ("filled", "executed", "filled_partial", "exited"):
                     is_exit   = h_status == "exited"
@@ -3639,17 +4997,45 @@ def build_dashboard(user=None):
                 settled_tag = ""
                 if h_actual_dir and h_status in ("filled", "executed", "filled_partial"):
                     settled_tag = f'<span style="font-size:9px;color:#8b949e;flex-shrink:0">→{h_actual_dir}</span>'
-                rows_html += f'<div style="display:flex;align-items:center;gap:6px;padding:2px 0;border-bottom:1px solid #21262d;min-width:0">' \
-                             f'<span style="font-size:9px;color:#6e7681;min-width:30px;flex-shrink:0">{h_time_s}</span>' \
-                             f'<span style="font-size:10px;color:#e6edf3;font-weight:600;min-width:22px;flex-shrink:0">{h_dir}</span>' \
-                             f'<span style="font-size:10px;color:#8b949e;flex-shrink:0">{h_contracts}c @ {entry_disp}</span>' \
+                rows_html += f'<div style="display:flex;align-items:center;gap:4px;padding:2px 0;border-bottom:1px solid #21262d;overflow:hidden;width:100%;box-sizing:border-box">' \
+                             f'<span style="font-size:9px;color:#adbac7;min-width:32px;flex-shrink:0">{h_time_s}</span>' \
+                             f'<span style="font-size:10px;color:#e6edf3;font-weight:600;min-width:20px;flex-shrink:0">{h_dir}</span>' \
+                             f'<span style="font-size:10px;color:#8b949e;flex-shrink:0">{h_contracts}c@{entry_disp}</span>' \
                              f'{settled_tag}' \
-                             f'<span style="font-size:10px;color:{row_color};margin-left:4px;flex-shrink:0">{result_s}</span>' \
+                             f'<span style="font-size:10px;color:{row_color};flex-shrink:0;margin-left:2px">{result_s}</span>' \
+                             f'<span style="flex:1"></span>' \
                              f'{pnl_s}</div>'
             if rows_html or active_html:
+                # Assessment of recent live results
+                all_resolved = [r for r in hist if r[4] is not None and r[3] in ("filled","executed","filled_partial","exited")]
+                if len(all_resolved) >= 3:
+                    recent_wins  = sum(1 for r in all_resolved if r[4] > 0)
+                    recent_pnl   = sum(r[4] for r in all_resolved)
+                    recent_wr    = recent_wins / len(all_resolved)
+                    avg_win      = sum(r[4] for r in all_resolved if r[4] > 0) / max(recent_wins, 1)
+                    avg_loss     = sum(r[4] for r in all_resolved if r[4] <= 0) / max(len(all_resolved) - recent_wins, 1)
+                    stop_losses  = sum(1 for r in all_resolved if r[3] == "exited" and "stop_loss" in (r[7] or ""))
+                    if recent_wr >= 0.60:
+                        assess_color = "#3fb950"
+                        assess_icon  = "↑"
+                        assess_txt   = f"{recent_wins}/{len(all_resolved)} wins · avg +${avg_win:.2f}"
+                    elif recent_wr >= 0.45:
+                        assess_color = "#e3b341"
+                        assess_icon  = "~"
+                        assess_txt   = f"{recent_wins}/{len(all_resolved)} wins · P&L ${recent_pnl:+.2f}"
+                    else:
+                        assess_color = "#f85149"
+                        assess_icon  = "↓"
+                        sl_note      = f" · {stop_losses} stop-outs" if stop_losses else ""
+                        assess_txt   = f"{recent_wins}/{len(all_resolved)} wins{sl_note} · avg loss ${avg_loss:.2f}"
+                    assess_html = f'<div style="display:flex;align-items:center;gap:5px;margin-bottom:4px;padding:3px 0">' \
+                                  f'<span style="font-size:10px;color:{assess_color};font-weight:700">{assess_icon}</span>' \
+                                  f'<span style="font-size:9px;color:{assess_color}">{assess_txt}</span></div>'
+                else:
+                    assess_html = ""
                 live_indicator = f'<div style="margin-top:6px;padding:6px 0 4px 0;border-top:1px solid #21262d;overflow:hidden;box-sizing:border-box;width:100%" onclick="event.stopPropagation();window.location=\'/fill-quality\'">' \
                                  f'<div style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">LIVE ORDERS</div>' \
-                                 f'{active_html}{rows_html}</div>'
+                                 f'{assess_html}{active_html}{rows_html}</div>'
             else:
                 live_indicator = f'<div style="margin-top:6px;padding:4px 8px;border-radius:6px;background:#0d1117;border:1px solid #30363d;display:flex;align-items:center;gap:6px">' \
                                  f'<span style="font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px">LIVE</span>' \
@@ -3664,6 +5050,7 @@ def build_dashboard(user=None):
     <div style="margin-left:auto;text-align:right"><div class="price" style="font-size:15px;color:{'#3fb950' if total_pnl>=0 else '#f85149'}">${(pool_balance if (pool_on and coin_is_live_mode and pool_balance is not None) else capital):.2f}</div><div style="font-size:10px;color:#8b949e">{'pool' if (pool_on and coin_is_live_mode and pool_balance is not None) else price_str}</div></div>
   </div>
   <div class="stat-row"><span class="stat-label">Kalshi Bid/Ask</span><span class="stat-value">{yes_bid:.3f} / {yes_ask:.3f}</span></div>
+  <div class="stat-row"><span class="stat-label">24h Volume</span><span class="stat-value" style="color:{'#3fb950' if mkt.get('volume',0)>=1000 else '#e3b341' if mkt.get('volume',0)>=100 else '#f85149'}">{int(mkt.get('volume',0)):,} contracts {'✅' if mkt.get('volume',0)>=1000 else '⚠️' if mkt.get('volume',0)>=100 else '🔴'}</span></div>
   <div style="margin:4px 0 2px 0">{prob_bar(yes_bid, yes_ask, poly_price)}<span style="font-size:10px;color:#8b949e;margin-left:4px">{tooltip_html("prob_bar")}</span></div>
   {ev_html}
   <div class="stat-row"><span class="stat-label">P&amp;L / Rate</span><span class="stat-value"><span class="{pnl_cls}">${total_pnl:+.2f}</span> &nbsp; {win_rate}</span></div>
@@ -3718,7 +5105,7 @@ def build_dashboard(user=None):
 </div>\n'''
 
     body += '<div class="section-title">Recent Trades</div>\n'
-    for coin in COINS:
+    for coin in ordered_coins_dash:
         trades = recent_trades.get(coin, [])
         color  = COIN_COLORS[coin]
         letter = COIN_LETTERS[coin]
@@ -3793,7 +5180,8 @@ def build_decisions_page(user=None):
     # Coin filter from URL (passed via qs in handler)
     rows = conn.execute("""
         SELECT d.coin, d.window_ts, d.direction, d.entry, d.confidence, d.rationale, d.decided_at,
-               pt.result, pt.pnl, pt.size, pt.coin_open, pt.coin_close, pt.actual
+               pt.result, pt.pnl, pt.size, pt.coin_open, pt.coin_close, pt.actual,
+               d.retried_at, d.retry_count
         FROM decisions d
         LEFT JOIN paper_trades pt ON pt.coin=d.coin AND pt.window_ts=d.window_ts
         ORDER BY d.window_ts DESC LIMIT 200
@@ -3827,7 +5215,8 @@ def build_decisions_page(user=None):
         body += '<div class="card"><div class="muted">No windows yet.</div></div>'
     else:
         body += '<div class="card" style="overflow-x:auto">\n'
-        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Action</th><th>Entry</th><th>Conf</th><th>Size</th><th>Open→Close</th><th>Outcome</th><th>P&L</th><th>Why</th></tr>\n'
+        retry_snap = dict(_retry_coins)  # snapshot to avoid race
+        body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Coin</th><th>Action</th><th>Retry</th><th>Entry</th><th>Conf</th><th>Size</th><th>Open→Close</th><th>Outcome</th><th>P&L</th><th>Why</th></tr>\n'
         for (coin, wts), (kind, r) in sorted_items:
             color = COIN_COLORS.get(coin, "#555")
             t_str = ts_cst(wts).strftime("%m/%d %H:%M")
@@ -3835,9 +5224,10 @@ def build_decisions_page(user=None):
                 body += f'<tr style="opacity:0.45"><td>{t_str}</td>'
                 body += f'<td><span style="color:{color};font-weight:700">{coin}</span></td>'
                 body += f'<td><span class="badge badge-pass">NO DATA</span></td>'
+                body += f'<td class="muted">—</td>'
                 body += f'<td colspan="7" class="muted" style="font-size:11px">No tick data collected for this window</td></tr>\n'
                 continue
-            coin, wts, direction, entry, confidence, rationale, decided_at, result, pnl, size, coin_open, coin_close, actual = r
+            coin, wts, direction, entry, confidence, rationale, decided_at, result, pnl, size, coin_open, coin_close, actual, retried_at, retry_count = r
             conf_s = f"{confidence:.0%}" if confidence is not None else "—"
             entry_s = f"{entry:.3f}" if entry else "—"
             size_s  = f"${size:.0f}" if size else "—"
@@ -3848,7 +5238,10 @@ def build_decisions_page(user=None):
             rat_short = rat_full[:70] + ("…" if len(rat_full) > 70 else "")
 
             if direction == "PASS":
-                action = '<span class="badge badge-pass">PASS</span>'
+                if rat_full.startswith("[retrying]"):
+                    action = '<span class="badge badge-pass" style="background:#92400e;color:#fde68a">↻ RETRY</span>'
+                else:
+                    action = '<span class="badge badge-pass">PASS</span>'
                 outcome = '<span class="badge badge-pass">—</span>'
                 pnl_s = "—"; pnl_cls = "muted"
             elif result == "WIN":
@@ -3865,11 +5258,37 @@ def build_decisions_page(user=None):
                 pnl_s = "open" if direction not in ("PASS","") else "—"
                 pnl_cls = "muted"
 
+            # Retry column
+            rat_check = rat_full.replace("[retrying] ", "")
+            is_retriable_rat = any(k in rat_check for k in ("fallback", "no engine signal", "Conf PASS", "Entry", "Risk block", "Volume PASS"))
+            secs_left_win = wts + 900 - int(time.time())
+            if direction == "PASS" and is_retriable_rat:
+                rcount_s = f" ×{retry_count}" if retry_count else ""
+                if retried_at:
+                    try:
+                        from datetime import datetime as _dt
+                        rt = _dt.fromisoformat(retried_at)
+                        rt_s = rt.strftime("%-I:%M%p").lower()
+                    except Exception:
+                        rt_s = retried_at[-8:-3]
+                    last_s = f'<span style="color:#6b7280;font-size:10px">last {rt_s}{rcount_s}</span>'
+                else:
+                    last_s = ''
+                if 0 < secs_left_win and secs_left_win >= RETRY_CUTOFF:
+                    next_loop = 30 - (int(time.time()) % 30)
+                    retry_cell = f'<span style="color:#f59e0b;font-size:11px">↻ {next_loop}s</span> {last_s}'
+                elif 0 < secs_left_win:
+                    retry_cell = f'<span style="color:#6b7280;font-size:11px">&lt;{RETRY_CUTOFF}s left</span> {last_s}'
+                else:
+                    retry_cell = last_s or '<span class="muted">—</span>'
+            else:
+                retry_cell = '<span class="muted">—</span>'
+
             rat_esc = rat_full.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
             row_click = f' onclick="showDetail(\'{rat_esc}\')" style="cursor:pointer" title="Click to read full rationale"' if rat_full else ''
             body += f'<tr{row_click}><td>{t_str}</td>'
             body += f'<td><a href="/coin/{coin}" onclick="event.stopPropagation()" style="color:{color};font-weight:700;text-decoration:none">{coin}</a></td>'
-            body += f'<td>{action}</td><td>{entry_s}</td><td>{conf_s}</td><td>{size_s}</td>'
+            body += f'<td>{action}</td><td>{retry_cell}</td><td>{entry_s}</td><td>{conf_s}</td><td>{size_s}</td>'
             body += f'<td style="font-size:11px">{oc_str}</td><td>{outcome}</td>'
             body += f'<td class="{pnl_cls}">{pnl_s}</td>'
             body += f'<td class="muted" style="font-size:11px">{rat_short}</td></tr>\n'
@@ -4404,7 +5823,8 @@ def build_settings_page(user=None, msg=""):
 <div class="form-row"><span class="form-label">Tracked Polymarket Wallets</span><input type="text" name="poly_tracked_wallets" value="{settings.get('poly_tracked_wallets', '')}" style="width:420px" placeholder="0xABC123...,0xDEF456... (comma-separated)"><span style="color:#8b949e;font-size:11px;margin-left:8px">Wallet addresses to copy-trade. Their recent buys/sells are shown to the LLM as smart money signals.</span></div>
 <div style="margin-top:16px;padding-top:14px;border-top:1px solid #21262d">
   <div style="font-size:12px;font-weight:600;color:#58a6ff;margin-bottom:10px">Early Exit Engine</div>
-  <div class="form-row"><span class="form-label">Take Profit (%)</span><input type="number" name="exit_take_profit_pct" value="{settings.get('exit_take_profit_pct', 40)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell when unrealized P&L ≥ this % of stake. 0 = disabled.</span></div>
+  <div class="form-row"><span class="form-label">Hard Take Profit (%)</span><input type="number" name="exit_hard_tp_pct" value="{settings.get('exit_hard_tp_pct', 80)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell immediately at this gain regardless of time remaining. 0 = disabled.</span></div>
+  <div class="form-row"><span class="form-label">Take Profit (%)</span><input type="number" name="exit_take_profit_pct" value="{settings.get('exit_take_profit_pct', 40)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Trailing stop / lock-in threshold. 0 = disabled.</span></div>
   <div class="form-row"><span class="form-label">Stop Loss (%)</span><input type="number" name="exit_stop_loss_pct" value="{settings.get('exit_stop_loss_pct', 65)}" step="5" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell when losing ≥ this % of stake (recovers remaining value). 0 = disabled.</span></div>
   <div class="form-row"><span class="form-label">Time Cliff (secs)</span><input type="number" name="exit_time_cliff_secs" value="{settings.get('exit_time_cliff_secs', 90)}" step="10" min="0" style="width:100px"><span style="color:#8b949e;font-size:11px;margin-left:8px">Sell any winning position when this many seconds remain. 0 = disabled.</span></div>
   <div class="form-row"><span class="form-label">LLM Mid-Window Check</span><select name="exit_llm_check" style="width:100px"><option value="1" {"selected" if settings.get("exit_llm_check","1")=="1" else ""}>Enabled</option><option value="0" {"selected" if settings.get("exit_llm_check","1")=="0" else ""}>Disabled</option></select><span style="color:#8b949e;font-size:11px;margin-left:8px">Ask LLM to evaluate hold/sell at ~midpoint of window.</span></div>
@@ -4656,10 +6076,10 @@ def build_fill_quality_page(user=None):
             except:
                 ts = str(wts)
             dir_color  = "#3fb950" if direction == "YES" else "#f85149"
-            sc = {"filled": "#3fb950", "placed": "#e3b341", "failed": "#f85149", "canceled": "#8b949e"}.get(status, "#8b949e")
-            icon = {"filled": "✓", "placed": "⏳", "failed": "✗", "canceled": "–"}.get(status, "?")
+            status_lbl, sc = order_status_label(status, filled, wts)
+            icon = {"filled": "✓", "placed": "⏳", "failed": "✗", "exited": "→"}.get(status, "–")
             oid_short  = (order_id or "")[:14] + "…" if order_id and len(order_id) > 14 else (order_id or "—")
-            filled_s   = f"{filled}c" if filled is not None else "—"
+            filled_s   = f"{filled}c" if filled else "—"
             avg_s      = f"{avg_price*100:.0f}¢" if avg_price else f"{limit_price}¢ limit"
             err_s      = ""
             if status == "failed" and error:
@@ -4675,7 +6095,7 @@ def build_fill_quality_page(user=None):
   <div style="width:40px;font-size:11px;color:#8b949e">{filled_s}</div>
   <div style="flex:1;font-size:10px;color:#555;font-family:monospace">{oid_short}</div>
   <div style="width:60px;text-align:right;font-size:11px;font-weight:600;color:{"#3fb950" if pnl and pnl>0 else "#f85149" if pnl and pnl<0 else "#8b949e"}">{f"+${pnl:.2f}" if pnl and pnl>0 else f"-${abs(pnl):.2f}" if pnl and pnl<0 else "—"}</div>
-  <div style="width:80px;text-align:right"><span style="font-size:11px;font-weight:600;color:{sc}">{icon} {status}</span>{err_s}</div>
+  <div style="width:110px;text-align:right"><span style="font-size:11px;font-weight:600;color:{sc}">{icon} {status_lbl}</span>{err_s}</div>
 </div>'''
         body += '</div>\n'
 
@@ -4837,6 +6257,174 @@ def build_engines_page(user=None, msg=""):
 
 
 # ── Research page ────────────────────────────────────────────────────────────────
+def build_chat_page(user=None):
+    """Standalone chat + live feed page — no auto-reload, safe to keep open."""
+    uname = user.get("username", "") if user else ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Autobet Chat</title>
+<style>
+{SHARED_CSS}
+html, body {{ height: 100%; margin: 0; overflow: hidden; background: #0d1117; }}
+#app {{ display: flex; flex-direction: column; height: 100vh; width: 100%; background: #0d1117; }}
+#chat-header {{ padding: 10px 14px; background: #161b22; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 8px; }}
+#chat-header .title {{ font-weight: 700; font-size: 14px; color: #e6edf3; flex: 1; }}
+.chat-tab {{ background: none; border: 1px solid #30363d; border-radius: 6px; color: #8b949e; font-size: 11px; padding: 3px 12px; cursor: pointer; }}
+.chat-tab.active {{ background: #1f6feb; border-color: #1f6feb; color: #fff; }}
+#chat-msgs {{ flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }}
+.chat-msg {{ padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; max-width: 90%; white-space: pre-wrap; }}
+.chat-msg.user {{ background: #1f3a5f; align-self: flex-end; }}
+.chat-msg.assistant {{ background: #21262d; align-self: flex-start; }}
+#chat-input-row {{ padding: 10px; border-top: 1px solid #30363d; display: flex; gap: 8px; flex-shrink: 0; }}
+#chat-input {{ flex: 1; resize: none; height: 40px; font-family: inherit; font-size: 14px; }}
+#live-feed {{ flex: 1; overflow-y: auto; padding: 10px 12px; display: none; flex-direction: column; font-family: monospace; font-size: 11px; gap: 2px; }}
+#live-feed.active {{ display: flex; }}
+.live-line {{ color: #8b949e; white-space: pre-wrap; word-break: break-all; padding: 1px 0; border-bottom: 1px solid #161b22; }}
+.live-line.hl-decision {{ color: #58a6ff; }}
+.live-line.hl-trade {{ color: #3fb950; }}
+.live-line.hl-exit {{ color: #f0883e; }}
+.live-line.hl-error {{ color: #f85149; }}
+#live-status {{ font-size: 10px; padding: 3px 12px; color: #8b949e; border-top: 1px solid #30363d; flex-shrink: 0; }}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="chat-header">
+    <span class="title">⚡ Autobet</span>
+    <button class="chat-tab active" id="tab-chat" onclick="switchTab('chat')">Chat</button>
+    <button class="chat-tab" id="tab-live" onclick="switchTab('live')">⬤ Live</button>
+    <span style="font-size:11px;color:#8b949e;margin-left:4px">{uname}</span>
+  </div>
+  <div id="chat-msgs"></div>
+  <div id="live-feed"></div>
+  <div id="live-status" style="display:none">connecting…</div>
+  <div id="chat-input-row">
+    <textarea id="chat-input" class="form-input" placeholder="Ask about trades, decisions, settings…"
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){{event.preventDefault();sendChat();}}"></textarea>
+    <button class="btn btn-primary" id="chat-send" onclick="sendChat()">Send</button>
+  </div>
+</div>
+<script>
+var CHAT_KEY = 'autobet_chat_v1';
+function chatSave(msgs) {{ try {{ localStorage.setItem(CHAT_KEY, JSON.stringify(msgs)); }} catch(e) {{}} }}
+function chatLoad() {{ try {{ return JSON.parse(localStorage.getItem(CHAT_KEY) || '[]'); }} catch(e) {{ return []; }} }}
+
+(function() {{
+  var history = chatLoad();
+  history.forEach(function(m) {{ appendChat(m.role, m.text, false); }});
+}})();
+
+function appendChat(role, text, save) {{
+  if (save === undefined) save = true;
+  var msgs = document.getElementById('chat-msgs');
+  var div = document.createElement('div');
+  div.className = 'chat-msg ' + role;
+  div.textContent = text;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+  if (save) {{
+    var history = chatLoad();
+    history.push({{role: role, text: text}});
+    if (history.length > 40) history = history.slice(-40);
+    chatSave(history);
+  }}
+}}
+
+function sendChat() {{
+  var inp = document.getElementById('chat-input');
+  var msg = inp.value.trim();
+  if (!msg) return;
+  inp.value = '';
+  appendChat('user', msg);
+  var btn = document.getElementById('chat-send');
+  btn.disabled = true; btn.textContent = '…';
+  var typing = document.createElement('div');
+  typing.className = 'chat-msg assistant';
+  typing.id = 'chat-typing';
+  typing.innerHTML = '<span style="letter-spacing:2px">&#8226;&#8226;&#8226;</span>';
+  typing.style.opacity = '0.5';
+  document.getElementById('chat-msgs').appendChild(typing);
+  document.getElementById('chat-msgs').scrollTop = 99999;
+  fetch('/api/chat', {{
+    method: 'POST', credentials: 'same-origin',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{message: msg}})
+  }}).then(function(r) {{
+    if (r.status === 401) throw new Error('Session expired');
+    return r.json();
+  }}).then(function(d) {{
+    var t = document.getElementById('chat-typing');
+    if (t) t.remove();
+    appendChat('assistant', d.reply || d.error || 'No response');
+  }}).catch(function(e) {{
+    var t = document.getElementById('chat-typing');
+    if (t) t.remove();
+    appendChat('assistant', 'Error: ' + e.message);
+  }}).finally(function() {{ btn.disabled = false; btn.textContent = 'Send'; }});
+}}
+
+var _liveTab = 'chat';
+var _liveES = null;
+var _livePaused = false;
+
+function switchTab(tab) {{
+  _liveTab = tab;
+  document.getElementById('tab-chat').classList.toggle('active', tab === 'chat');
+  document.getElementById('tab-live').classList.toggle('active', tab === 'live');
+  document.getElementById('chat-msgs').style.display = tab === 'chat' ? '' : 'none';
+  document.getElementById('chat-input-row').style.display = tab === 'chat' ? '' : 'none';
+  var lf = document.getElementById('live-feed');
+  var ls = document.getElementById('live-status');
+  if (tab === 'live') {{
+    lf.classList.add('active'); ls.style.display = '';
+    startLiveFeed(); lf.scrollTop = lf.scrollHeight;
+  }} else {{
+    lf.classList.remove('active'); ls.style.display = 'none';
+  }}
+}}
+
+function liveLineClass(text) {{
+  if (/\\[DECISION\\]|\\[DUAL LLM\\]|\\[ENGINE\\]|\\[DECIDE\\]/i.test(text)) return 'live-line hl-decision';
+  if (/placed|WIN|filled|order_id/i.test(text)) return 'live-line hl-trade';
+  if (/\\[EXIT\\]|hard_take_profit|trailing_stop|stop_loss|time_cliff/i.test(text)) return 'live-line hl-exit';
+  if (/error|exception|traceback|failed/i.test(text)) return 'live-line hl-error';
+  return 'live-line';
+}}
+
+function appendLiveLine(text) {{
+  var lf = document.getElementById('live-feed');
+  var div = document.createElement('div');
+  div.className = liveLineClass(text);
+  div.textContent = text;
+  lf.appendChild(div);
+  while (lf.children.length > 500) lf.removeChild(lf.firstChild);
+  if (!_livePaused) lf.scrollTop = lf.scrollHeight;
+}}
+
+function startLiveFeed() {{
+  if (_liveES) return;
+  var ls = document.getElementById('live-status');
+  ls.textContent = 'connecting…';
+  _liveES = new EventSource('/api/log-stream');
+  _liveES.onopen = function() {{ ls.textContent = '● live'; ls.style.color = '#3fb950'; }};
+  _liveES.onmessage = function(e) {{ if (e.data) appendLiveLine(e.data); }};
+  _liveES.onerror = function() {{
+    ls.textContent = '○ disconnected — retrying'; ls.style.color = '#f85149';
+    _liveES.close(); _liveES = null;
+    setTimeout(function() {{ if (_liveTab === 'live') startLiveFeed(); }}, 3000);
+  }};
+  document.getElementById('live-feed').addEventListener('scroll', function() {{
+    _livePaused = this.scrollTop < this.scrollHeight - this.clientHeight - 40;
+  }});
+}}
+</script>
+</body>
+</html>"""
+
+
 def build_research_page(user=None):
     import glob
     ar = os.path.expanduser("~/autoresearch")
@@ -5135,6 +6723,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html(build_engines_page(user=user))
             elif path == "/health":
                 self.send_html(build_health_page(user=user))
+            elif path == "/recovery":
+                self.send_html(build_recovery_page(user=user))
+            elif path == "/chat":
+                self.send_html(build_chat_page(user=user))
             elif path == "/insights":
                 coin_f = qs.get("coin", [None])[0]
                 self.send_html(build_insights_page(user=user, coin_filter=coin_f))
@@ -5146,6 +6738,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Set-Cookie", "autobet_session=; Path=/; Max-Age=0")
                 self.send_header("Location", "/login")
                 self.end_headers()
+            # Live log SSE stream
+            elif path == "/api/log-stream":
+                if not user:
+                    self.send_response(401); self.end_headers(); return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                ev = threading.Event()
+                with _log_lock:
+                    # Snapshot current ring; track by sequence number
+                    snapshot = list(_log_ring)  # list of (seq, text)
+                    last_seq = snapshot[-1][0] if snapshot else 0
+                    _log_subscribers.append(ev)
+                try:
+                    for _, text in snapshot:
+                        self.wfile.write(f"data: {text}\n\n".encode())
+                    self.wfile.flush()
+                    while True:
+                        ev.wait(timeout=25)
+                        ev.clear()
+                        with _log_lock:
+                            current = list(_log_ring)
+                        # Deliver only entries with seq > last_seq
+                        new_entries = [(s, t) for s, t in current if s > last_seq]
+                        if new_entries:
+                            last_seq = new_entries[-1][0]
+                            for _, text in new_entries:
+                                self.wfile.write(f"data: {text}\n\n".encode())
+                            self.wfile.flush()
+                        else:
+                            # Keepalive ping
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except Exception:
+                    pass
+                finally:
+                    with _log_lock:
+                        try: _log_subscribers.remove(ev)
+                        except ValueError: pass
+                return
+
             # API endpoints
             elif path == "/api/health":
                 self.send_json({"status": "ok", "ts": int(time.time()), "model": get_minimax_model()})
@@ -5461,6 +7097,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             audit("engines_saved", "engines", payload=params, actor=user["username"] if user else "system")
             self.redirect("/engines?saved=1")
 
+        elif path == "/recovery/settings":
+            user_r = self.require_auth()
+            if not user_r: return
+            params = urllib.parse.parse_qs(raw.decode())
+            kvs = [
+                ("recovery_enabled",        "1" if "recovery_enabled" in params else "0"),
+                ("recovery_live_enabled",   "1" if "recovery_live_enabled" in params else "0"),
+                ("recovery_threshold_cents", params.get("recovery_threshold_cents", ["5"])[0]),
+                ("recovery_max_contracts",  params.get("recovery_max_contracts", ["20"])[0]),
+            ]
+            conn_s = db_connect()
+            for k, v in kvs:
+                conn_s.execute("INSERT OR REPLACE INTO settings (key,value,updated_at) VALUES (?,?,?)",
+                               (k, v, now_cst().isoformat()))
+            conn_s.commit(); conn_s.close()
+            self.redirect("/recovery?msg=Settings+saved")
+        elif path == "/recovery/backtest":
+            user_r = self.require_auth()
+            if not user_r: return
+            params = urllib.parse.parse_qs(raw.decode())
+            tc  = int(params.get("threshold_cents", ["5"])[0])
+            msl = int(params.get("min_secs_left", ["60"])[0])
+            result = backtest_recovery_watcher(threshold_cents=tc, min_secs_left=msl)
+            self.send_html(build_recovery_page(user=user_r, backtest_result=result))
+        elif path == "/api/recovery/backtest":
+            tc  = int(urllib.parse.parse_qs(raw.decode()).get("threshold_cents", ["5"])[0])
+            result = backtest_recovery_watcher(threshold_cents=tc)
+            self.send_json(result)
         elif path == "/api/chat":
             chat_user = get_session(self)
             if not chat_user and is_onboarding_complete():
@@ -5472,6 +7136,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             reply = handle_chat(message, user=chat_user)
             self.send_json(reply)
+
+        elif path == "/api/cancel_order":
+            if not user:
+                self.send_json({"error": "unauthorized"}, 401)
+                return
+            order_id = params.get("order_id", "").strip()
+            if not order_id:
+                self.send_json({"error": "order_id required"}, 400)
+                return
+            ok, err = cancel_kalshi_order(order_id)
+            if ok:
+                # Mark canceled in DB
+                conn = db_connect()
+                conn.execute(
+                    "UPDATE live_orders SET status='canceled', resolved_at=? WHERE order_id=?",
+                    (now_cst().isoformat(), order_id)
+                )
+                conn.commit()
+                conn.close()
+                audit("order_canceled", "live_orders", order_id, actor=user["username"])
+                print(f"[CANCEL] {order_id} canceled by {user['username']}")
+                self.send_json({"ok": True})
+            else:
+                self.send_json({"error": err}, 500)
 
         else:
             self.send_json({"error": "not found"}, 404)
@@ -5659,7 +7347,8 @@ def build_coin_page(coin, user=None):
         FROM paper_trades WHERE coin=? ORDER BY window_ts DESC LIMIT 50
     """, (coin,)).fetchall()
     decisions = conn.execute("""
-        SELECT d.window_ts, d.direction, d.entry, d.confidence, d.rationale, pt.result, pt.pnl
+        SELECT d.window_ts, d.direction, d.entry, d.confidence, d.rationale, pt.result, pt.pnl,
+               d.retried_at, d.retry_count
         FROM decisions d LEFT JOIN paper_trades pt ON pt.coin=d.coin AND pt.window_ts=d.window_ts
         WHERE d.coin=? ORDER BY d.window_ts DESC LIMIT 30
     """, (coin,)).fetchall()
@@ -5730,19 +7419,42 @@ def build_coin_page(coin, user=None):
         body += '<div class="muted">No decisions yet.</div>'
     else:
         body += '<table class="trade-table"><tr><th>Time (CT)</th><th>Dir</th><th>Entry</th><th>Conf</th><th>Rationale</th><th>Result</th><th>P&L</th></tr>\n'
-        for wts, direction, entry, conf, rationale, result, pnl in decisions:
+        for wts, direction, entry, conf, rationale, result, pnl, retried_at, retry_count in decisions:
             t_s    = ts_cst(wts).strftime("%m/%d %H:%M") if wts else "?"
             conf_s = f"{conf:.0%}" if conf else "—"
             rat    = rationale or ""
             is_fallback = "fallback" in rat.lower() or "Market favors" in rat
             is_blocked  = direction == "PASS"
+            is_retriable = is_blocked and any(k in rat.replace("[retrying] ", "") for k in ("fallback", "no engine signal", "Conf PASS", "Entry", "Risk block", "Volume PASS"))
+            in_retry = is_retriable and _retry_coins.get(coin) == wts
             bc    = "badge-win" if result=="WIN" else "badge-loss" if result=="LOSS" else "badge-pass" if is_blocked else "badge-open"
             res_s = result or ("PASS" if is_blocked else "OPEN")
             pnl_s = f"${pnl:+.2f}" if pnl is not None else "—"
             pnl_c2 = "green" if (pnl or 0)>0 else "red" if (pnl or 0)<0 else "muted"
-            row_style = ' style="opacity:0.5"' if is_fallback else ""
+            row_style = ' style="opacity:0.5"' if (is_fallback and not in_retry) else ""
             fallback_tag = ' <span style="font-size:9px;color:#f85149;font-weight:700">FALLBACK</span>' if is_fallback else ""
-            body += f'<tr{row_style}><td>{t_s}</td><td>{direction}{fallback_tag}</td><td>{entry:.3f}</td><td>{conf_s}</td>'
+            cur_wts = kalshi_window_ts()
+            retry_tag = ""
+            if is_retriable:
+                secs_left_w = max(0, wts + 900 - int(time.time()))
+                rcount_s = f" ×{retry_count}" if retry_count else ""
+                if retried_at:
+                    try:
+                        from datetime import datetime as _dt
+                        rt_s = _dt.fromisoformat(retried_at).strftime("%-I:%M%p").lower()
+                    except Exception:
+                        rt_s = (retried_at or "")[-8:-3]
+                    last_s = f'<span style="font-size:9px;color:#6b7280">last {rt_s}{rcount_s}</span>'
+                else:
+                    last_s = ""
+                if secs_left_w >= RETRY_CUTOFF:
+                    next_retry = 30 - (int(time.time()) % 30)
+                    retry_tag = f' <span style="font-size:9px;color:#e3b341;font-weight:700">↻ {next_retry}s</span> {last_s}'
+                elif secs_left_w > 0:
+                    retry_tag = f' <span style="font-size:9px;color:#8b949e">&lt;{RETRY_CUTOFF}s</span> {last_s}'
+                elif last_s:
+                    retry_tag = f' {last_s}'
+            body += f'<tr{row_style}><td>{t_s}</td><td>{direction}{fallback_tag}{retry_tag}</td><td>{entry:.3f}</td><td>{conf_s}</td>'
             rat_short2 = rat[:60] + ("…" if len(rat) > 60 else "")
             rat_esc2 = rat.replace("\\", "\\\\").replace("'", "\\'")
             click2 = f' onclick="showDetail(\'{rat_esc2}\')" style="cursor:pointer"' if len(rat) > 60 else ''
@@ -5837,6 +7549,35 @@ def build_coin_page(coin, user=None):
     else:
         body += '<div class="muted">No ticks yet.</div>'
     body += '</div>\n'
+    idx  = COINS.index(coin)
+    prev_coin = COINS[(idx - 1) % len(COINS)]
+    next_coin = COINS[(idx + 1) % len(COINS)]
+    color = COIN_COLORS.get(coin, "#ccc")
+    # Coin icon strip — all coins as clickable badges, active one highlighted
+    icons_html = '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:14px">'
+    for c in COINS:
+        c_color = COIN_COLORS.get(c, "#ccc")
+        c_letter = COIN_LETTERS.get(c, c[0])
+        is_active = (c == coin)
+        outline = f'outline:2px solid {c_color};outline-offset:2px;' if is_active else ''
+        opacity = '1' if is_active else '0.45'
+        icons_html += (
+            f'<a href="/coin/{c}" style="text-decoration:none" title="{c}">'
+            f'<div class="coin-badge" style="background:{c_color};{outline}opacity:{opacity}">{c_letter}</div></a>'
+        )
+    icons_html += '</div>'
+    nav_html = (
+        f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">'
+        f'<a href="/coin/{prev_coin}" style="display:inline-flex;align-items:center;gap:5px;padding:6px 14px;'
+        f'background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;text-decoration:none;font-size:13px;font-weight:600">'
+        f'← {prev_coin}</a>'
+        f'<span style="flex:1;text-align:center;font-size:15px;font-weight:700;color:{color}">{coin}</span>'
+        f'<a href="/coin/{next_coin}" style="display:inline-flex;align-items:center;gap:5px;padding:6px 14px;'
+        f'background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;text-decoration:none;font-size:13px;font-weight:600">'
+        f'{next_coin} →</a>'
+        f'</div>'
+    )
+    body = nav_html + icons_html + body
     return page_shell(f"{coin}", f"/coin/{coin}", body, user=user)
 
 
@@ -6000,9 +7741,12 @@ def main():
         threading.Thread(target=collect_prices,        daemon=True, name="prices"),
         threading.Thread(target=collect_kalshi,        daemon=True, name="kalshi"),
         threading.Thread(target=collect_polymarket,    daemon=True, name="polymarket"),
+        threading.Thread(target=collect_okx,           daemon=True, name="okx"),
         threading.Thread(target=decision_loop,         daemon=True, name="decisions"),
+        threading.Thread(target=pre_signal_loop,       daemon=True, name="pre_signal"),
         threading.Thread(target=live_order_sync_loop,  daemon=True, name="live_sync"),
         threading.Thread(target=blackout_recalc_loop,  daemon=True, name="blackout_recalc"),
+        threading.Thread(target=recovery_watcher_loop, daemon=True, name="recovery_watcher"),
     ]
     for t in threads:
         t.start()

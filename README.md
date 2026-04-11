@@ -1,6 +1,6 @@
 # autobet
 
-Multi-venue prediction market trading platform. Trades Kalshi 15-minute crypto contracts across BTC, XRP, SOL, ETH, DOGE, BNB, HYPE. Supports paper and live trading with dual-LLM decision making (MiniMax M2.5 primary + adversarial skeptic), per-coin engine selection, Kelly-criterion sizing, smart money copy-trading, early exit engine, and full audit trail.
+Multi-venue prediction market trading platform. Trades Kalshi 15-minute crypto contracts across BTC, XRP, SOL, ETH, DOGE, BNB, HYPE. Supports paper and live trading with dual-LLM decision making (MiniMax M2.5 primary + adversarial skeptic), per-coin engine selection, Kelly-criterion sizing, smart money copy-trading, pre-signal fast entry, reversal hedging, lottery buys, and full audit trail.
 
 **Dashboard:** http://ryz.local:7778
 
@@ -13,7 +13,7 @@ Multi-venue prediction market trading platform. Trades Kalshi 15-minute crypto c
 - Single Python file: `autobet_main.py` (~5,000 lines)
 - SQLite database: `data/autobet.db` (WAL mode)
 - Stdlib HTTP server — no external web frameworks
-- Background threads: prices (30s), Kalshi ticks (60s), Polymarket + wallet signals (90s), decision loop, live order sync (60s)
+- Background threads: prices (30s), Kalshi ticks (adaptive: 10s active / sleep-to-boundary idle), Polymarket + wallet signals (90s), decision loop, pre-signal (fires 65s before each window), live order sync (60s)
 
 ## Start / Restart
 
@@ -50,7 +50,7 @@ cd ~/autobet && nohup python3 -u autobet_main.py >> autobet.log 2>&1 &
 | `MAX_CONTRACTS` | 500 | Order book depth cap per trade |
 | `KALSHI_FEE_RATE` | 7% | Of `entry × (1-entry)`, capped at $0.02/contract |
 | `STARTING_CAPITAL` | $500 | Per-coin paper account starting balance |
-| `TRADE_SIZE` | $20 | Default stake per trade |
+| `TRADE_SIZE` | $15 | Default stake per trade |
 
 ---
 
@@ -144,16 +144,18 @@ Applied per-window before any trade is placed:
 9. Paper trade recorded; if coin is live mode, order placed via Kalshi REST API
 10. `sync_live_orders()` polls Kalshi every 60s to update fill status
 11. `check_exit_positions()` evaluates early exit every 60s (see Early Exit Engine)
+12. `check_lottery_buys()` runs alongside exit check — fires lottery orders in last 5 min if cheap contracts appear
 12. `resolve_live_orders()` fetches Kalshi settlement after window close and records P&L
 
 ---
 
 ## Early Exit Engine
 
-Monitors all filled live positions every 60 seconds. Four exit rules:
+Monitors all filled live positions every 60 seconds. Five exit rules (checked in priority order):
 
 | Rule | Trigger | Setting key |
 |---|---|---|
+| **Price target** | Contract price hits ≥ N¢ | `exit_price_target_cents` (default 90¢) |
 | **Trailing stop** | Was up ≥ take_profit_pct%, then fell 15% from peak | `exit_take_profit_pct` (default 40%) |
 | **Profit lock** | Up ≥ take_profit_pct% with < 120s remaining | `exit_take_profit_pct` |
 | **Stop loss** | Down ≥ stop_loss_pct% of stake | `exit_stop_loss_pct` (default 65%) |
@@ -161,6 +163,40 @@ Monitors all filled live positions every 60 seconds. Four exit rules:
 | **LLM check** | At ~midpoint (~450s left), asks LLM hold/sell if P&L > 5% | `exit_llm_check` (default on) |
 
 Peak unrealized P&L is tracked per-position in settings (`trailing_peak_{order_id}`). Sells via `"action": "sell"` on the Kalshi orders endpoint.
+
+### Reversal Hedge
+
+When a position exits at ≥ `exit_price_target_cents`, the bot immediately buys `hedge_contracts` (default 25) of the **opposite side** at a limit of `hedge_max_ask_cents` (default 3¢).
+
+- **Cost:** $0.25 per position exit (25 × 1¢)
+- **Upside:** If market reverses after exit, 25 × $1 = $25 from a $0.25 bet
+- **Held to expiry** — not subject to stop-loss, trailing stop, or time cliff
+- Configurable: `hedge_enabled`, `hedge_contracts`, `hedge_max_ask_cents`
+
+### Lottery Buys
+
+Independent of existing positions. In the last 1–5 minutes of any window (`lottery_min_secs_left`–`lottery_max_secs_left`), if either YES or NO drops to ≤ `lottery_max_ask_cents` (default 2¢), the bot buys `lottery_contracts` (default 20) contracts at market.
+
+- **Cost:** $0.20 per trigger (20 × 1¢)
+- **Upside:** 20 × $1 = $20 from a $0.20 bet if the market snaps back
+- Fires once per coin per window, held to expiry
+- Configurable: `lottery_enabled`, `lottery_contracts`, `lottery_max_ask_cents`, `lottery_min_secs_left`, `lottery_max_secs_left`
+
+---
+
+## Pre-Signal Fast Entry
+
+A dedicated `pre_signal_loop` thread fires MiniMax analysis for all live coins **~65 seconds before each window boundary**. The result is cached in `_pre_signals`.
+
+At window open, `_decide_coin` checks for a cached pre-signal (< 120s old). If found:
+- Skips the MiniMax API call entirely
+- Uses the cached direction/confidence
+- Recalculates entry from the live market price at window open
+- Places the order within **2–3 seconds** of window open instead of 15–20s
+
+Without pre-signal: order arrives 15–20s into the window (market may have moved from 19¢ to 40¢). With pre-signal: order arrives at 2–3s, capturing the opening price.
+
+Pre-signals are consumed on use. If the pre-signal is stale or absent, the bot falls back to the normal MiniMax call.
 
 ---
 
